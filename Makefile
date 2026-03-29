@@ -25,21 +25,26 @@ ASSET_DIR  := assets
 OUT_DIR    := out
 
 SRCS := $(SRC_DIR)/main.cpp \
-        $(SRC_DIR)/stb_impl.cpp
+        $(SRC_DIR)/themes.cpp \
+        $(SRC_DIR)/glyph_cache.cpp \
+        $(SRC_DIR)/stb_impl.cpp \
+        $(SRC_DIR)/vendor/fpng.cpp
 
 FONT_FRAUNCES  := $(ASSET_DIR)/Fraunces-Bold.ttf
 FONT_DMMONO    := $(ASSET_DIR)/DMMono-Medium.ttf
+FONT_INTER     := $(ASSET_DIR)/Inter-VariableFont_opsz,wght.ttf
 
 HDR_FRAUNCES   := $(GEN_DIR)/font_fraunces.h
 HDR_DMMONO     := $(GEN_DIR)/font_dmmono.h
-GENERATED      := $(HDR_FRAUNCES) $(HDR_DMMONO)
+HDR_INTER      := $(GEN_DIR)/font_inter.h
+GENERATED      := $(HDR_FRAUNCES) $(HDR_DMMONO) $(HDR_INTER)
 
 # ── Common flags (all builds) ─────────────────────────────────────────────────
 CXXSTD   := -std=c++20
 WARNINGS := -Wall -Wextra -Wno-unused-parameter
 INCLUDES := -I$(GEN_DIR) -I$(VENDOR_DIR) -I$(SRC_DIR)
 
-# ── Dev flags ─────────────────────────────────────────────────────────────────
+# ── Dev / Mac flags ──────────────────────────────────────────────────────────
 ifeq ($(HOST_ARCH), arm64)
     ARCH_NATIVE := -march=native -mcpu=native
 else
@@ -47,8 +52,19 @@ else
 endif
 
 CXXFLAGS_DEV := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
-                -O0 -g -fno-omit-frame-pointer $(ARCH_NATIVE)
+                -O3 -g -fno-omit-frame-pointer $(ARCH_NATIVE)
 LDFLAGS_DEV  :=
+
+CXXFLAGS_MAC := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
+                -O3 -ffast-math -funroll-loops -fvectorize \
+                -fomit-frame-pointer -fno-exceptions -fno-rtti \
+                -flto -fwhole-program-vtables \
+                -fstrict-aliasing -fstrict-overflow \
+                -fmerge-all-constants \
+                -fdata-sections -ffunction-sections \
+                -mllvm -inline-threshold=500 \
+                -mcpu=apple-m4
+LDFLAGS_MAC  := -flto -dead_strip
 
 # ── San flags ─────────────────────────────────────────────────────────────────
 CXXFLAGS_SAN := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
@@ -58,8 +74,11 @@ LDFLAGS_SAN  := -fsanitize=address,undefined
 
 # ── Release base flags (shared across all variants) ───────────────────────────
 CXXFLAGS_REL_BASE := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
-                     -O3 -ffast-math -funroll-loops \
-                     -fomit-frame-pointer -fno-exceptions -flto
+                     -O3 -ffast-math -funroll-loops -fvectorize \
+                     -fomit-frame-pointer -fno-exceptions -flto \
+                     -fmerge-all-constants \
+                     -fdata-sections -ffunction-sections \
+                     -mllvm -inline-threshold=500
 LDFLAGS_REL       := -static -flto
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,82 +111,51 @@ ZIG_X86   := x86_64-linux-musl
 ZIG_ARM64 := aarch64-linux-musl
 
 # helper — build one release variant
-# $(call release_variant, suffix, zig-triple, arch-flags)
+# $(call release_variant,suffix,zig-triple,arch-flags)  — no spaces after commas!
 define release_variant
-$(OUT_DIR)/billpreview-$(1): $(GENERATED) | $(OUT_DIR)
-	$(ZIG) -target $(2) \
-	    $(CXXFLAGS_REL_BASE) $(3) \
+$(OUT_DIR)/billpreview-$(strip $(1)): $(GENERATED) | $(OUT_DIR)
+	$(ZIG) -target $(strip $(2)) \
+	    $(CXXFLAGS_REL_BASE) $(strip $(3)) \
 	    -o $$@ $(SRCS) $(LDFLAGS_REL)
-	@printf "  ✓ %-40s $$(shell ls -lh $$@ | awk '{print $$5}')\n" "billpreview-$(1)"
+	@printf "  ✓ %-40s $$(shell ls -lh $$@ | awk '{print $$5}')\n" "billpreview-$(strip $(1))"
 endef
 
 # ── x86_64 variants ───────────────────────────────────────────────────────────
-$(eval $(call release_variant,\
-    x86_64-generic,\
-    $(ZIG_X86),\
-    -march=x86-64-v3 -mtune=generic))
-
-$(eval $(call release_variant,\
-    x86_64-v4,\
-    $(ZIG_X86),\
-    -march=x86-64-v4 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mtune=generic))
-
-$(eval $(call release_variant,\
-    x86_64-v4-znver4,\
-    $(ZIG_X86),\
-    -march=x86-64-v4 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mtune=znver4))
-
-$(eval $(call release_variant,\
-    x86_64-v4-znver3,\
-    $(ZIG_X86),\
-    -march=x86-64-v4 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mtune=znver3))
-
-$(eval $(call release_variant,\
-    x86_64-v4-spr,\
-    $(ZIG_X86),\
-    -march=x86-64-v4 -mavx512f -mavx512bw -mavx512dq -mavx512vl -mtune=sapphirerapids))
-
-$(eval $(call release_variant,\
-    x86_64-v3-skx,\
-    $(ZIG_X86),\
-    -march=x86-64-v3 -mtune=skylake))
+$(eval $(call release_variant,x86_64-generic,$(ZIG_X86),-mcpu=x86_64_v3 -mpclmul))
+$(eval $(call release_variant,x86_64-v4,$(ZIG_X86),-mcpu=x86_64_v4 -mpclmul))
+$(eval $(call release_variant,x86_64-v4-znver4,$(ZIG_X86),-mcpu=znver4 -mpclmul))
+$(eval $(call release_variant,x86_64-v4-znver3,$(ZIG_X86),-mcpu=znver3 -mpclmul))
+$(eval $(call release_variant,x86_64-v4-spr,$(ZIG_X86),-mcpu=sapphirerapids -mpclmul))
+$(eval $(call release_variant,x86_64-v3-skx,$(ZIG_X86),-mcpu=skylake -mpclmul))
 
 # ── arm64 variants ────────────────────────────────────────────────────────────
-$(eval $(call release_variant,\
-    arm64-generic,\
-    $(ZIG_ARM64),\
-    -march=armv8-a -mtune=generic))
+$(eval $(call release_variant,arm64-generic,$(ZIG_ARM64),-mcpu=generic))
+$(eval $(call release_variant,arm64-graviton2,$(ZIG_ARM64),-mcpu=neoverse_n1))
+$(eval $(call release_variant,arm64-graviton3,$(ZIG_ARM64),-mcpu=neoverse_v1))
+$(eval $(call release_variant,arm64-ampere,$(ZIG_ARM64),-mcpu=ampere1))
 
-$(eval $(call release_variant,\
-    arm64-graviton2,\
-    $(ZIG_ARM64),\
-    -march=armv8.2-a -mcpu=neoverse-n1 -mtune=neoverse-n1))
-
-$(eval $(call release_variant,\
-    arm64-graviton3,\
-    $(ZIG_ARM64),\
-    -march=armv8.4-a+sve -mcpu=neoverse-v1 -mtune=neoverse-v1))
-
-$(eval $(call release_variant,\
-    arm64-ampere,\
-    $(ZIG_ARM64),\
-    -march=armv8.6-a -mcpu=ampere1 -mtune=ampere1))
+# ── macOS arm64 variant — system compiler, same flags as 'make mac' ──────────
+$(OUT_DIR)/billpreview-mac-arm64: $(GENERATED) | $(OUT_DIR)
+	$(CXX_NATIVE) $(CXXFLAGS_MAC) -o $@ $(SRCS) $(LDFLAGS_MAC)
+	@strip $@
+	@printf "  ✓ %-40s %s\n" "billpreview-mac-arm64" "$$(ls -lh $@ | awk '{print $$5}')"
 
 # ── Collect all release targets ───────────────────────────────────────────────
 RELEASE_TARGETS := \
-    $(OUT_DIR)/billpreview-x86_64-generic    \
-    $(OUT_DIR)/billpreview-x86_64-v4         \
-    $(OUT_DIR)/billpreview-x86_64-v4-znver4  \
-    $(OUT_DIR)/billpreview-x86_64-v4-znver3  \
-    $(OUT_DIR)/billpreview-x86_64-v4-spr     \
-    $(OUT_DIR)/billpreview-x86_64-v3-skx     \
-    $(OUT_DIR)/billpreview-arm64-generic     \
-    $(OUT_DIR)/billpreview-arm64-graviton2   \
-    $(OUT_DIR)/billpreview-arm64-graviton3   \
-    $(OUT_DIR)/billpreview-arm64-ampere
+    $(OUT_DIR)/billpreview-x86_64-generic   \
+    $(OUT_DIR)/billpreview-x86_64-v4        \
+    $(OUT_DIR)/billpreview-x86_64-v4-znver4 \
+    $(OUT_DIR)/billpreview-x86_64-v4-znver3 \
+    $(OUT_DIR)/billpreview-x86_64-v4-spr    \
+    $(OUT_DIR)/billpreview-x86_64-v3-skx    \
+    $(OUT_DIR)/billpreview-arm64-generic    \
+    $(OUT_DIR)/billpreview-arm64-graviton2  \
+    $(OUT_DIR)/billpreview-arm64-graviton3  \
+    $(OUT_DIR)/billpreview-arm64-ampere     \
+    $(OUT_DIR)/billpreview-mac-arm64
 
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: all dev san release clean info
+.PHONY: all dev mac san prof release clean info
 
 all: dev
 
@@ -184,6 +172,10 @@ $(HDR_DMMONO): $(FONT_DMMONO) | $(GEN_DIR)
 	xxd -i $< > $@
 	@echo "[xxd] $< → $@"
 
+$(HDR_INTER): $(FONT_INTER) | $(GEN_DIR)
+	xxd -i $< > $@
+	@echo "[xxd] $< → $@"
+
 # ── Dev ───────────────────────────────────────────────────────────────────────
 dev: $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_DEV) -o $(OUT_DIR)/billpreview $(SRCS) $(LDFLAGS_DEV)
@@ -191,12 +183,27 @@ dev: $(GENERATED) | $(OUT_DIR)
 	@echo "  ✓ dev  $(OUT_DIR)/billpreview  [$(HOST_ARCH) / $(HOST_OS)]"
 	@ls -lh $(OUT_DIR)/billpreview
 
+# ── Mac optimised (native clang, LTO, vectorised, dead-strip) ────────────────
+mac: $(GENERATED) | $(OUT_DIR)
+	$(CXX_NATIVE) $(CXXFLAGS_MAC) -o $(OUT_DIR)/billpreview-mac $(SRCS) $(LDFLAGS_MAC)
+	@strip $(OUT_DIR)/billpreview-mac
+	@echo ""
+	@echo "  ✓ mac  $(OUT_DIR)/billpreview-mac  [$(HOST_ARCH) / $(HOST_OS) optimised]"
+	@ls -lh $(OUT_DIR)/billpreview-mac
+
 # ── San ───────────────────────────────────────────────────────────────────────
 san: $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_SAN) -o $(OUT_DIR)/billpreview-san $(SRCS) $(LDFLAGS_SAN)
 	@echo ""
 	@echo "  ✓ san  $(OUT_DIR)/billpreview-san  [asan + ubsan]"
 	@ls -lh $(OUT_DIR)/billpreview-san
+
+# ── Prof (mac flags + -DPROFILE — prints per-stage µs breakdown) ──────────────
+prof: $(GENERATED) | $(OUT_DIR)
+	$(CXX_NATIVE) $(CXXFLAGS_MAC) -DPROFILE -o $(OUT_DIR)/billpreview-prof $(SRCS) $(LDFLAGS_MAC)
+	@strip $(OUT_DIR)/billpreview-prof
+	@echo ""
+	@echo "  ✓ prof  $(OUT_DIR)/billpreview-prof  [profiling build]"
 
 # ── Release — all variants ────────────────────────────────────────────────────
 release: $(GENERATED) | $(OUT_DIR)
@@ -209,6 +216,8 @@ release: $(GENERATED) | $(OUT_DIR)
 	@ls -lh $(OUT_DIR)/billpreview-x86_64-* 2>/dev/null | awk '{print "  "$$5"  "$$9}'
 	@echo "── arm64 ────────────────────────────────"
 	@ls -lh $(OUT_DIR)/billpreview-arm64-*  2>/dev/null | awk '{print "  "$$5"  "$$9}'
+	@echo "── macOS arm64 ──────────────────────────"
+	@ls -lh $(OUT_DIR)/billpreview-mac-arm64 2>/dev/null | awk '{print "  "$$5"  "$$9}'
 	@echo ""
 
 # ── Info ──────────────────────────────────────────────────────────────────────
@@ -217,6 +226,12 @@ info:
 	@echo "host os    : $(HOST_OS)"
 	@echo "native cxx : $(CXX_NATIVE)"
 	@echo "arch flags : $(ARCH_NATIVE)"
+	@echo ""
+	@echo "targets:"
+	@echo "  make dev      — debug build (current machine)"
+	@echo "  make mac      — optimised build (current machine, -O3)"
+	@echo "  make san      — asan + ubsan build"
+	@echo "  make release  — all cross-compiled Linux variants"
 	@echo ""
 	@echo "release variants:"
 	@$(foreach t,$(RELEASE_TARGETS),echo "  $(t)";)
