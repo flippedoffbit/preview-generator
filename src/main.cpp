@@ -412,10 +412,323 @@ struct Renderer
 // protocol: client sends  "name\tamount\tdate\n"
 //           server replies <4 bytes LE PNG size><4 bytes LE render_us><PNG bytes>
 // ─────────────────────────────────────────────────────────────────────────────
+// ── Protocol backends ─────────────────────────────────────────────────────────
+// Build with:
+//   make release          → legacy UDS (default, tab-delimited)
+//   make release PROTO=HTTP  → bare HTTP/1.0 over UDS
+//   make release PROTO=FCGI  → FastCGI over UDS (nginx fastcgi_pass)
+
+#if defined(PROTO_FCGI)
+
+#pragma pack(push, 1)
+struct FcgiHeader
+{
+    uint8_t version;
+    uint8_t type;
+    uint16_t request_id;  // big-endian
+    uint16_t content_len; // big-endian
+    uint8_t padding_len;
+    uint8_t reserved;
+};
+#pragma pack(pop)
+
+enum FcgiType : uint8_t
+{
+    FCGI_BEGIN_REQUEST = 1,
+    FCGI_END_REQUEST = 3,
+    FCGI_PARAMS = 4,
+    FCGI_STDIN = 5,
+    FCGI_STDOUT = 6,
+};
+
+static uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
+static uint16_t to_be16(uint16_t v) { return (uint16_t)((v >> 8) | (v << 8)); }
+
+static bool read_exact(int fd, uint8_t *dst, int n)
+{
+    while (n > 0)
+    {
+        int r = read(fd, dst, n);
+        if (r <= 0)
+            return false;
+        dst += r;
+        n -= r;
+    }
+    return true;
+}
+
+static void fcgi_write_record(int fd, uint8_t type, uint16_t req_id,
+                              const uint8_t *data, uint16_t len)
+{
+    FcgiHeader hdr{};
+    hdr.version = 1;
+    hdr.type = type;
+    hdr.request_id = to_be16(req_id);
+    hdr.content_len = to_be16(len);
+    write(fd, &hdr, sizeof(hdr));
+    if (len)
+        write(fd, data, len);
+}
+
+static std::string url_decode(const std::string &s)
+{
+    std::string r;
+    for (int i = 0; i < (int)s.size();)
+    {
+        if (s[i] == '+')
+        {
+            r += ' ';
+            ++i;
+        }
+        else if (s[i] == '%' && i + 2 < (int)s.size())
+        {
+            char h[3] = {s[i + 1], s[i + 2], 0};
+            r += (char)strtol(h, nullptr, 16);
+            i += 3;
+        }
+        else
+            r += s[i++];
+    }
+    return r;
+}
+
+static std::string fcgi_extract_qs(const uint8_t *p, int len)
+{
+    int i = 0;
+    while (i < len)
+    {
+        auto read_len = [&]() -> int
+        {
+            if (i >= len)
+                return 0;
+            if ((p[i] & 0x80) == 0)
+                return p[i++];
+            if (i + 4 > len)
+                return 0;
+            int v = ((p[i] & 0x7f) << 24) | (p[i + 1] << 16) | (p[i + 2] << 8) | p[i + 3];
+            i += 4;
+            return v;
+        };
+        int nlen = read_len(), vlen = read_len();
+        if (i + nlen + vlen > len)
+            break;
+        std::string key((char *)p + i, nlen);
+        i += nlen;
+        std::string val((char *)p + i, vlen);
+        i += vlen;
+        if (key == "QUERY_STRING")
+            return val;
+    }
+    return {};
+}
+
+static void parse_qs(const std::string &qs,
+                     std::string &name, std::string &amount,
+                     std::string &date, std::string &theme_id)
+{
+    size_t pos = 0;
+    while (pos < qs.size())
+    {
+        size_t amp = qs.find('&', pos);
+        if (amp == std::string::npos)
+            amp = qs.size();
+        std::string pair = qs.substr(pos, amp - pos);
+        size_t eq = pair.find('=');
+        if (eq != std::string::npos)
+        {
+            std::string k = pair.substr(0, eq);
+            std::string v = url_decode(pair.substr(eq + 1));
+            if (k == "company")
+                name = v;
+            else if (k == "amount")
+                amount = v;
+            else if (k == "date")
+                date = v;
+            else if (k == "theme")
+                theme_id = v;
+        }
+        pos = amp + 1;
+    }
+}
+
+static void handle_client_fcgi(int cli, Renderer &renderer)
+{
+    std::string name, amount, date, theme_id;
+    uint16_t req_id = 1;
+
+    while (true)
+    {
+        FcgiHeader hdr;
+        if (!read_exact(cli, (uint8_t *)&hdr, sizeof(hdr)))
+            return;
+
+        uint16_t clen = be16((uint8_t *)&hdr.content_len);
+        req_id = be16((uint8_t *)&hdr.request_id);
+
+        std::vector<uint8_t> body(clen + hdr.padding_len);
+        if (!body.empty() && !read_exact(cli, body.data(), body.size()))
+            return;
+
+        if (hdr.type == FCGI_PARAMS && clen > 0)
+        {
+            std::string qs = fcgi_extract_qs(body.data(), clen);
+            if (!qs.empty())
+                parse_qs(qs, name, amount, date, theme_id);
+        }
+        else if (hdr.type == FCGI_STDIN && clen == 0)
+            break; // end of request
+    }
+
+    if (name.empty())
+        return;
+
+    const Theme &theme = theme_id.empty()
+                             ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
+                             : theme_by_id(theme_id.c_str());
+
+    printf("[fcgi] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
+           name.c_str(), amount.c_str(), date.c_str(), theme.id);
+    fflush(stdout);
+
+    auto t_start = std::chrono::steady_clock::now();
+    auto png = renderer.render(name, amount, date, theme);
+    auto t_end = std::chrono::steady_clock::now();
+    uint32_t render_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+    printf("[render] %u µs  (%.2f ms)\n", render_us, render_us / 1000.f);
+    fflush(stdout);
+
+    // STDOUT: headers + body (chunk if > 65535)
+    char hdrs[256];
+    int hlen = snprintf(hdrs, sizeof(hdrs),
+                        "Content-Type: image/png\r\nContent-Length: %zu\r\n\r\n", png.size());
+    fcgi_write_record(cli, FCGI_STDOUT, req_id, (uint8_t *)hdrs, (uint16_t)hlen);
+
+    // chunk PNG into 65535-byte records
+    size_t sent = 0;
+    while (sent < png.size())
+    {
+        uint16_t chunk = (uint16_t)std::min<size_t>(65535, png.size() - sent);
+        fcgi_write_record(cli, FCGI_STDOUT, req_id, png.data() + sent, chunk);
+        sent += chunk;
+    }
+
+    fcgi_write_record(cli, FCGI_STDOUT, req_id, nullptr, 0); // end stream
+    uint8_t end[8] = {};
+    fcgi_write_record(cli, FCGI_END_REQUEST, req_id, end, 8);
+}
+
+#elif defined(PROTO_HTTP)
+
+static std::string url_decode(const std::string &s)
+{
+    std::string r;
+    for (int i = 0; i < (int)s.size();)
+    {
+        if (s[i] == '+')
+        {
+            r += ' ';
+            ++i;
+        }
+        else if (s[i] == '%' && i + 2 < (int)s.size())
+        {
+            char h[3] = {s[i + 1], s[i + 2], 0};
+            r += (char)strtol(h, nullptr, 16);
+            i += 3;
+        }
+        else
+            r += s[i++];
+    }
+    return r;
+}
+
+static void handle_client_http(int cli, Renderer &renderer)
+{
+    // read only first line
+    char buf[2048] = {};
+    int i = 0;
+    char c;
+    while (i < (int)sizeof(buf) - 1)
+    {
+        if (read(cli, &c, 1) <= 0)
+            break;
+        buf[i++] = c;
+        if (i >= 2 && buf[i - 2] == '\r' && buf[i - 1] == '\n')
+            break;
+    }
+
+    char *q = strchr(buf, '?');
+    char *sp = q ? strchr(q, ' ') : nullptr;
+    if (!q || !sp)
+    {
+        close(cli);
+        return;
+    }
+
+    std::string qs(q + 1, sp);
+    std::string name, amount, date, theme_id;
+
+    size_t pos = 0;
+    while (pos < qs.size())
+    {
+        size_t amp = qs.find('&', pos);
+        if (amp == std::string::npos)
+            amp = qs.size();
+        std::string pair = qs.substr(pos, amp - pos);
+        size_t eq = pair.find('=');
+        if (eq != std::string::npos)
+        {
+            std::string k = pair.substr(0, eq);
+            std::string v = url_decode(pair.substr(eq + 1));
+            if (k == "company")
+                name = v;
+            else if (k == "amount")
+                amount = v;
+            else if (k == "date")
+                date = v;
+            else if (k == "theme")
+                theme_id = v;
+        }
+        pos = amp + 1;
+    }
+
+    if (name.empty())
+    {
+        const char *r400 = "HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
+        write(cli, r400, strlen(r400));
+        return;
+    }
+
+    const Theme &theme = theme_id.empty()
+                             ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
+                             : theme_by_id(theme_id.c_str());
+
+    printf("[http] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
+           name.c_str(), amount.c_str(), date.c_str(), theme.id);
+    fflush(stdout);
+
+    auto t_start = std::chrono::steady_clock::now();
+    auto png = renderer.render(name, amount, date, theme);
+    auto t_end = std::chrono::steady_clock::now();
+    uint32_t render_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
+    printf("[render] %u µs  (%.2f ms)\n", render_us, render_us / 1000.f);
+    fflush(stdout);
+
+    char hdr[256];
+    int hl = snprintf(hdr, sizeof(hdr),
+                      "HTTP/1.0 200 OK\r\nContent-Type: image/png\r\nContent-Length: %zu\r\n\r\n",
+                      png.size());
+    write(cli, hdr, hl);
+    write(cli, png.data(), png.size());
+}
+
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────────
+// run_daemon — unchanged signature, protocol selected at compile time
+// ─────────────────────────────────────────────────────────────────────────────
 void run_daemon(Renderer &renderer)
 {
     unlink(SOCKET_PATH);
-
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0)
     {
@@ -433,7 +746,15 @@ void run_daemon(Renderer &renderer)
         return;
     }
     listen(srv, 8);
-    printf("[ok] listening on %s\n", SOCKET_PATH);
+
+#if defined(PROTO_FCGI)
+    printf("[ok] listening on %s  [FCGI]\n", SOCKET_PATH);
+#elif defined(PROTO_HTTP)
+    printf("[ok] listening on %s  [HTTP]\n", SOCKET_PATH);
+#else
+    printf("[ok] listening on %s  [UDS]\n", SOCKET_PATH);
+#endif
+    fflush(stdout);
 
     while (true)
     {
@@ -441,9 +762,18 @@ void run_daemon(Renderer &renderer)
         if (cli < 0)
             continue;
 
+#if defined(PROTO_FCGI)
+        handle_client_fcgi(cli, renderer);
+        close(cli);
+
+#elif defined(PROTO_HTTP)
+        handle_client_http(cli, renderer);
+        close(cli);
+
+#else
+        // ── legacy tab-delimited UDS (original) ──────────────────────────────
         char buf[512] = {};
         read(cli, buf, sizeof(buf) - 1);
-
         std::string req(buf);
         auto t1 = req.find('\t');
         auto t2 = req.find('\t', t1 + 1);
@@ -455,8 +785,6 @@ void run_daemon(Renderer &renderer)
 
         std::string name = req.substr(0, t1);
         std::string amount = req.substr(t1 + 1, t2 - t1 - 1);
-
-        // Optional 4th tab field: theme_id
         std::string date, theme_id;
         auto t3 = req.find('\t', t2 + 1);
         if (t3 == std::string::npos)
@@ -473,7 +801,6 @@ void run_daemon(Renderer &renderer)
                 theme_id.pop_back();
         }
 
-        // Select theme: explicit id → amount ladder
         const Theme &theme = theme_id.empty()
                                  ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
                                  : theme_by_id(theme_id.c_str());
@@ -485,18 +812,16 @@ void run_daemon(Renderer &renderer)
         auto t_start = std::chrono::steady_clock::now();
         auto png = renderer.render(name, amount, date, theme);
         auto t_end = std::chrono::steady_clock::now();
-        uint32_t render_us = (uint32_t)std::chrono::duration_cast<
-                                 std::chrono::microseconds>(t_end - t_start)
-                                 .count();
-
+        uint32_t render_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
         printf("[render] %u µs  (%.2f ms)\n", render_us, render_us / 1000.f);
         fflush(stdout);
 
         uint32_t sz = (uint32_t)png.size();
         write(cli, &sz, 4);
-        write(cli, &render_us, 4); // render time so client can display it
+        write(cli, &render_us, 4);
         write(cli, png.data(), png.size());
         close(cli);
+#endif
     }
 }
 
