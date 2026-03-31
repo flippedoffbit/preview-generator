@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 #include <string>
 #include <chrono>
 #include <sys/socket.h>
@@ -251,6 +252,117 @@ static std::string fit_or_truncate(Font &font, const std::string &text, int max_
     return t + "\xe2\x80\xa6"; // UTF-8 ellipsis U+2026
 }
 
+// Normalize/format incoming date strings into a human-friendly form:
+// e.g. "2026-03-30" or "30 Mar 2026" -> "30 March 2026 Tuesday"
+static std::string format_date_display(const std::string &in)
+{
+    auto trim = [](const std::string &s) -> std::string
+    {
+        size_t a = s.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos)
+            return "";
+        size_t b = s.find_last_not_of(" \t\r\n");
+        return s.substr(a, b - a + 1);
+    };
+
+    std::string s = trim(in);
+    if (s.empty())
+        return s;
+
+    // map month short -> number
+    auto month_from_name = [](const std::string &mstr) -> int
+    {
+        if (mstr.empty())
+            return -1;
+        std::string low;
+        for (char c : mstr)
+            low.push_back((char)std::tolower((unsigned char)c));
+        if (low.size() >= 3)
+            low = low.substr(0, 3);
+        static const char *tbl[] = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
+        for (int i = 0; i < 12; ++i)
+            if (low == tbl[i])
+                return i + 1;
+        return -1;
+    };
+
+    int y = 0, m = 0, d = 0;
+
+    // Try ISO-like YYYY-MM-DD
+    if (sscanf(s.c_str(), "%d-%d-%d", &y, &m, &d) == 3 && y > 0 && m >= 1 && m <= 12 && d >= 1 && d <= 31)
+    {
+        // parsed successfully
+    }
+    else
+    {
+        // try space-separated tokens: "30 Mar 2026" or "2026 Mar 30"
+        std::istringstream iss(s);
+        std::string a, b, c;
+        if (!(iss >> a))
+            return in;
+        if (!(iss >> b))
+            return in;
+        if (!(iss >> c))
+            return in;
+
+        // case: "d mon yyyy"
+        if (c.size() == 4 && std::isdigit((unsigned char)c[0]))
+        {
+            try
+            {
+                d = std::stoi(a);
+                m = month_from_name(b);
+                y = std::stoi(c);
+            }
+            catch (...)
+            {
+                return in;
+            }
+        }
+        // case: "yyyy mon d"
+        else if (a.size() == 4 && std::isdigit((unsigned char)a[0]))
+        {
+            try
+            {
+                y = std::stoi(a);
+                m = month_from_name(b);
+                d = std::stoi(c);
+            }
+            catch (...)
+            {
+                return in;
+            }
+        }
+        else
+        {
+            return in;
+        }
+        if (m < 1 || m > 12 || d < 1 || d > 31)
+            return in;
+    }
+
+    // compute weekday using Zeller's congruence (Gregorian)
+    int Y = y;
+    int M = m;
+    int D = d;
+    if (M <= 2)
+    {
+        M += 12;
+        Y -= 1;
+    }
+    int K = Y % 100;
+    int J = Y / 100;
+    int h = (D + (13 * (M + 1)) / 5 + K + (K / 4) + (J / 4) + (5 * J)) % 7;
+    // Zeller: 0=Saturday,1=Sunday,2=Monday,...
+    static const char *wday[] = {"Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"};
+
+    static const char *month_name[] = {"January", "February", "March", "April", "May", "June",
+                                       "July", "August", "September", "October", "November", "December"};
+
+    std::string out = std::to_string(d) + " " + month_name[m - 1] + " " + std::to_string(y) + " " + wday[h];
+    return out;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Renderer
 // ─────────────────────────────────────────────────────────────────────────────
@@ -308,9 +420,7 @@ struct Renderer
         canvas.fill(theme.bg);
         PROF_LAP("canvas.fill");
 
-        // ── 2. top accent bar (3px, full width) ───────────────────────────────
-        canvas.rect(0, 0, IMG_W, 3, theme.accent);
-        PROF_LAP("accent bar");
+        // NOTE: top accent bar removed — embedding apps control their own chrome.
 
         // ── layout constants ──────────────────────────────────────────────────
         const int LEFT = 80;
@@ -320,15 +430,16 @@ struct Renderer
         // ── 3. split name into base + optional business suffix ────────────────
         auto [base_name, suffix] = split_business_suffix(name);
 
-        // ── 4. sub-label: "BILLED TO" ─────────────────────────────────────────
-        dmmono.set_size(22.f);
-        y = 100;
+        // ── 4. sub-label: "BILLED TO" (larger for legibility)
+        dmmono.set_size(28.f);
+        y = 72;
         dmmono.draw(canvas, "BILLED TO", LEFT, y, theme.sub_label, 3.5f);
         PROF_LAP("BILLED TO");
-        // ── 5. name (Fraunces Bold, auto-fitted) ──────────────────────────────
+
+        // ── 5. name (Fraunces Bold, auto-fitted) — allow larger max size
         const int NAME_MAX_W = RIGHT - LEFT;
-        const float NAME_SZ_MAX = 82.f;
-        const float NAME_SZ_MIN = 42.f;
+        const float NAME_SZ_MAX = 110.f;
+        const float NAME_SZ_MIN = 48.f;
         const float NAME_SZ_STEP = 4.f;
 
         float name_sz = NAME_SZ_MAX;
@@ -338,57 +449,72 @@ struct Renderer
             name_sz -= NAME_SZ_STEP;
             fraunces.set_size(name_sz);
         }
-        // last-resort: truncate with ellipsis at minimum size
         std::string display_name = fit_or_truncate(fraunces, base_name, NAME_MAX_W);
 
-        y = 148;
+        y = 120;
         fraunces.draw(canvas, display_name.c_str(), LEFT, y, theme.name);
         PROF_LAP("name draw");
 
-        // ── 6. business suffix label (if present) ─────────────────────────────
-        //    DM Mono 26px, warm mid-grey — clearly readable, secondary to name
+        // compute bottom of name glyphs for next layout steps
+        int name_baseline = y + (int)(fraunces.ascent * fraunces.scale);
+        int name_bottom = name_baseline + (int)(std::abs(fraunces.descent) * fraunces.scale);
+
+        // ── 6. business suffix label (if present)
         if (!suffix.empty())
         {
-            // bottom of name glyphs ≈ baseline + |descent|
-            int name_baseline = y + (int)(fraunces.ascent * fraunces.scale);
-            int name_bottom = name_baseline + (int)(std::abs(fraunces.descent) * fraunces.scale);
-
             dmmono.set_size(26.f);
-            int suf_y = name_bottom + 12;
+            int suf_y = name_bottom + 8;
             dmmono.draw(canvas, suffix.c_str(), LEFT, suf_y, theme.sub_name, 1.5f);
             PROF_LAP("suffix draw");
+            int suf_baseline = suf_y + (int)(dmmono.ascent * dmmono.scale);
+            int suf_bottom = suf_baseline + (int)(std::abs(dmmono.descent) * dmmono.scale);
+            if (suf_bottom > name_bottom)
+                name_bottom = suf_bottom;
         }
 
-        // ── 7. divider line ───────────────────────────────────────────────────
-        y = 310;
-        canvas.rect(LEFT, y, RIGHT - LEFT, 1, theme.divider);
+        // ── 7. divider line (moved up to reduce empty space)
+        int divider_y = name_bottom + 36;
+        canvas.rect(LEFT, divider_y, RIGHT - LEFT, 1, theme.divider);
 
-        // ── 8. "TOTAL PAYABLE" label ──────────────────────────────────────────
-        dmmono.set_size(20.f);
-        y = 340;
-        dmmono.draw(canvas, "TOTAL PAYABLE", LEFT, y, theme.amt_label, 3.f);
+        // ── 8. "TOTAL PAYABLE" label (larger)
+        dmmono.set_size(26.f);
+        int total_label_y = divider_y + 24;
+        dmmono.draw(canvas, "TOTAL PAYABLE", LEFT, total_label_y, theme.amt_label, 3.5f);
         PROF_LAP("TOTAL PAYABLE");
-        // ── 9. rupee symbol (accent colour) + amount (off-white) ──────────────
-        //    ₹ → Inter (correct stroke weight, clean glyph at any size).
-        //    Amount → DM Mono (monospaced digits).  Both baseline-aligned.
-        //    Rupee is drawn smaller than the amount digits for visual hierarchy.
-        dmmono.set_size(96.f);
-        inter.set_size(68.f); // ~70% of amount size — clearly secondary but readable
-        y = 380;
 
-        int amount_baseline = y + (int)(dmmono.ascent * dmmono.scale);
+        // ── 9. rupee symbol + amount — dynamic sizing (grow, then shrink to fit)
+        const float AMOUNT_SZ_MAX = 160.f;
+        const float AMOUNT_SZ_MIN = 36.f;
+        const float AMOUNT_SZ_STEP = 4.f;
+        const float RUPEE_RATIO = 0.7f; // rupee glyph ~70% of amount digit size
+        const int AMOUNT_SPACING = 8;
+
+        float amt_sz = AMOUNT_SZ_MAX;
+        int total_w = 0;
+        while (true)
+        {
+            dmmono.set_size(amt_sz);
+            inter.set_size(amt_sz * RUPEE_RATIO);
+            int rupee_w = inter.measure("₹");
+            int digits_w = dmmono.measure(amount.c_str());
+            total_w = rupee_w + AMOUNT_SPACING + digits_w;
+            if (total_w <= (RIGHT - LEFT) || amt_sz <= AMOUNT_SZ_MIN)
+                break;
+            amt_sz -= AMOUNT_SZ_STEP;
+        }
+
+        int amount_y = total_label_y + 36;
+        int amount_baseline = amount_y + (int)(dmmono.ascent * dmmono.scale);
         int rupee_top = amount_baseline - (int)(inter.ascent * inter.scale);
-
         int rupee_end = inter.draw(canvas, "₹", LEFT, rupee_top, theme.rupee);
-        dmmono.draw(canvas, amount.c_str(), rupee_end + 6, y, theme.amount);
+        dmmono.draw(canvas, amount.c_str(), rupee_end + AMOUNT_SPACING, amount_y, theme.amount);
         PROF_LAP("rupee + amount");
 
-        // ── 10. date — DM Mono, bottom right ──────────────────────────────────
-        dmmono.set_size(26.f);
-        y = 560;
-        // right-align: measure first, then offset
+        // ── 10. date — larger, bottom-right
+        dmmono.set_size(52.f);
+        int date_y = IMG_H - 64;
         int date_w = dmmono.measure(date.c_str());
-        dmmono.draw(canvas, date.c_str(), RIGHT - date_w, y, theme.date);
+        dmmono.draw(canvas, date.c_str(), RIGHT - date_w, date_y, theme.date);
         PROF_LAP("date");
 
         // ── 11. encode PNG ─────────────────────────────────────────────────────
@@ -586,6 +712,7 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
                              ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
                              : theme_by_id(theme_id.c_str());
 
+    date = format_date_display(date);
     printf("[fcgi] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
            name.c_str(), amount.c_str(), date.c_str(), theme.id);
     fflush(stdout);
@@ -702,6 +829,7 @@ static void handle_client_http(int cli, Renderer &renderer)
                              ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
                              : theme_by_id(theme_id.c_str());
 
+    date = format_date_display(date);
     printf("[http] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
            name.c_str(), amount.c_str(), date.c_str(), theme.id);
     fflush(stdout);
@@ -805,6 +933,7 @@ void run_daemon(Renderer &renderer)
                                  ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
                                  : theme_by_id(theme_id.c_str());
 
+        date = format_date_display(date);
         printf("[req] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
                name.c_str(), amount.c_str(), date.c_str(), theme.id);
         fflush(stdout);

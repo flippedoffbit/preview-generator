@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # longrun_ipc_generate.sh — Generate 200,000 images via IPC, discard output, monitor memory externally
 
-BINARY="./out/billpreview-mac-arm64"  # Adjust path as needed
+BINARY="./out/billpreview-mac"  # Adjust path as needed
 SOCKET="/tmp/billpreview.sock"
 ITERATIONS=200000
 NAME="Test User"

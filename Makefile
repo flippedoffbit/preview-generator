@@ -57,14 +57,19 @@ LDFLAGS_DEV  :=
 
 # ── Mac optimised flags ───────────────────────────────────────────────────────
 CXXFLAGS_MAC := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
-                -O3 -ffast-math -funroll-loops -fvectorize \
-                -fomit-frame-pointer -fno-exceptions -fno-rtti \
+                -Ofast -funroll-loops -fvectorize \
+                -fomit-frame-pointer -fno-rtti \
                 -flto -fwhole-program-vtables \
                 -fstrict-aliasing -fstrict-overflow \
                 -fmerge-all-constants \
                 -fdata-sections -ffunction-sections \
                 -mllvm -inline-threshold=500 \
-                -mcpu=apple-m4
+                -mcpu=apple-m4 \
+				-funsafe-math-optimizations \
+				-ffp-contract=fast \
+				-fno-signed-zeros -fno-trapping-math -freciprocal-math \
+                -fno-math-errno
+
 LDFLAGS_MAC  := -flto -dead_strip
 
 # ── San flags ─────────────────────────────────────────────────────────────────
@@ -84,16 +89,43 @@ LDFLAGS_SAN  := -fsanitize=address,undefined
 # -Wl,--gc-sections              actually perform the dead-strip at link time
 # -mpclmul                       CRC32 acceleration used by fpng (x86 only)
 CXXFLAGS_REL_BASE := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
-                     -O3 -ffast-math -funroll-loops -fvectorize \
+                     -Ofast \
+                     -funroll-loops -fvectorize \
                      -fomit-frame-pointer \
-                     -fno-exceptions -fno-rtti \
+                     -fno-rtti \
                      -fvisibility=hidden \
                      -fno-unwind-tables -fno-asynchronous-unwind-tables \
                      -fmerge-all-constants \
                      -fdata-sections -ffunction-sections \
-                     -flto \
-                     -mllvm -inline-threshold=500
+                     -flto=thin \
+                     -mllvm -inline-threshold=1000 \
+                     -funsafe-math-optimizations \
+                     -ffp-contract=fast \
+                     -fno-signed-zeros -fno-trapping-math -freciprocal-math \
+                     -floop-interchange \
+                     -fno-math-errno
+
 LDFLAGS_REL := -static -flto -Wl,--gc-sections
+
+# ── Profile Guided Optimisation (PGO) ────────────────────────────────────────
+# Local workflow (native host):
+# 1) make pgo-instrument-local   — build an instrumented binary
+# 2) make pgo-run-local          — run the instrumented binary against test cases
+# 3) make pgo-merge             — merge .profraw → .profdata (requires llvm-profdata)
+# 4) make pgo-opt-local         — rebuild optimized binary using the collected profile
+
+PGO_DIR        := $(OUT_DIR)/pgo
+PGO_PROFDATA   := $(PGO_DIR)/default.profdata
+
+# Instrumented build (no LTO, gather runtime profiles)
+CXXFLAGS_PGO_INSTR := $(CXXSTD) $(WARNINGS) $(INCLUDES) \
+					  -fprofile-instr-generate -O2 -g $(ARCH_NATIVE)
+LDFLAGS_PGO_INSTR  :=
+
+# Optimised build using collected profile data (uses release base flags)
+CXXFLAGS_PGO_USE := $(CXXFLAGS_REL_BASE) -fprofile-instr-use=$(PGO_PROFDATA)
+LDFLAGS_PGO_USE  := $(LDFLAGS_REL)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Protocol flag legend
@@ -283,6 +315,49 @@ prof: $(GENERATED) | $(OUT_DIR)
 	@strip $(OUT_DIR)/billpreview-prof
 	@echo ""
 	@echo "  ✓ prof  $(OUT_DIR)/billpreview-prof  [profiling build]"
+
+# ── PGO workflow (local/native) ──────────────────────────────────────────────
+.PHONY: pgo pgo-instrument-local pgo-run-local pgo-merge pgo-opt-local
+
+$(PGO_DIR):
+	mkdir -p $@
+
+pgo-instrument-local: $(GENERATED) | $(OUT_DIR) $(PGO_DIR)
+	$(CXX_NATIVE) $(CXXFLAGS_PGO_INSTR) -o $(OUT_DIR)/billpreview-pgo-instr $(SRCS) $(LDFLAGS_PGO_INSTR)
+	@echo ""
+	@printf "  ✓ pgo-instrument-local  %s\n" $(OUT_DIR)/billpreview-pgo-instr
+
+# Run the instrumented binary through the test harness to produce .profraw files.
+pgo-run-local: pgo-instrument-local
+	@echo "running instrumented binary to collect profiles in $(PGO_DIR)..."
+	@mkdir -p $(PGO_DIR)
+	@LLVM_PROFILE_FILE="$(PGO_DIR)/profile-%p.profraw" bash ./test.sh $(OUT_DIR)/billpreview-pgo-instr
+	@echo "collected profile data in $(PGO_DIR)"
+
+# Merge raw profiles into a single profdata file (requires llvm-profdata)
+pgo-merge:
+	@if command -v llvm-profdata >/dev/null 2>&1; then \
+		echo "merging profraw → $(PGO_PROFDATA)..."; \
+		llvm-profdata merge -o $(PGO_PROFDATA) $(PGO_DIR)/*.profraw; \
+		ls -lh $(PGO_PROFDATA); \
+	else \
+		echo "llvm-profdata not found; install llvm (e.g. 'brew install llvm' or use system llvm)"; exit 1; \
+	fi
+
+# Build an optimized binary using the collected profile data
+pgo-opt-local: $(GENERATED) | $(OUT_DIR)
+	@if [ -f $(PGO_PROFDATA) ]; then \
+		echo "building PGO-optimised binary..."; \
+		$(CXX_NATIVE) $(CXXFLAGS_PGO_USE) -o $(OUT_DIR)/billpreview-pgo-opt $(SRCS) $(LDFLAGS_PGO_USE); \
+		strip $(OUT_DIR)/billpreview-pgo-opt || true; \
+		printf "  ✓ pgo-opt-local %s\n" $(OUT_DIR)/billpreview-pgo-opt; \
+	else \
+		echo "missing $(PGO_PROFDATA) — run 'make pgo-run-local' then 'make pgo-merge'"; exit 1; \
+	fi
+
+# Convenience target: run the full PGO flow (instrument → run → merge → opt)
+pgo: pgo-run-local pgo-merge pgo-opt-local
+	@echo "PGO flow complete. Optimised binary: $(OUT_DIR)/billpreview-pgo-opt"
 
 # ── Release — focused proto targets ───────────────────────────────────────────
 release-uds: $(GENERATED) | $(OUT_DIR)

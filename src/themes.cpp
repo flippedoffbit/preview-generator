@@ -236,17 +236,27 @@ const Theme &theme_by_id(const char *id)
 
 const Theme &theme_for_amount(uint64_t amount_paise)
 {
+    // Determine base ladder index (0..5) from amount thresholds
+    int base = 0;
     if (amount_paise < 100'000ULL)
-        return THEMES[0]; // dark-purple  < ₹1,000
-    if (amount_paise < 1'000'000ULL)
-        return THEMES[1]; // dark-emerald < ₹10,000
-    if (amount_paise < 5'000'000ULL)
-        return THEMES[2]; // dark-amber   < ₹50,000
-    if (amount_paise < 10'000'000ULL)
-        return THEMES[3]; // dark-ice    < ₹1,00,000
-    if (amount_paise < 50'000'000ULL)
-        return THEMES[4]; // dark-rose   < ₹5,00,000
-    return THEMES[5];     // dark-slate  ₹5,00,000+
+        base = 0; // dark-purple  < ₹1,000
+    else if (amount_paise < 1'000'000ULL)
+        base = 1; // dark-emerald < ₹10,000
+    else if (amount_paise < 5'000'000ULL)
+        base = 2; // dark-amber   < ₹50,000
+    else if (amount_paise < 10'000'000ULL)
+        base = 3; // dark-ice    < ₹1,00,000
+    else if (amount_paise < 50'000'000ULL)
+        base = 4; // dark-rose   < ₹5,00,000
+    else
+        base = 5; // dark-slate  ₹5,00,000+
+
+    // Use the same colour ladder but pick the light variant for even
+    // numbers and the dark variant for odd numbers.  The light variants
+    // are at indices 6..11 (base + 6).
+    bool even = (amount_paise % 2) == 0;
+    int idx = base + (even ? 6 : 0);
+    return THEMES[idx];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
