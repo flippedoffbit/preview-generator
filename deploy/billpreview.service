@@ -45,6 +45,13 @@ AmbientCapabilities=
 # No outbound calls at all — a private network namespace with only loopback. The
 # AF_UNIX socket is a filesystem object, so nginx still reaches it across the ns.
 PrivateNetwork=yes
+# User namespace: a privilege escape inside the service sees remapped,
+# unprivileged host ids. systemd sets up the socket's billpreview:www-data
+# ownership through the idmap, so nginx still reaches it (verified live).
+PrivateUsers=yes
+# Redundant with PrivateNetwork (no netns access at all), kept so the
+# cgroup IP filter is explicit rather than absent.
+IPAddressDeny=any
 RestrictAddressFamilies=AF_UNIX
 # Read isolation: the binary is a static FCGI build with the fonts embedded, so
 # it reads NOTHING from disk — blank the whole filesystem view and bind back only
@@ -77,6 +84,10 @@ MemoryDenyWriteExecute=yes
 # docker's default. A violation kills the process; Restart brings it back.
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
+# Subtract the two groups systemd-analyze flags inside @system-service: the
+# renderer calls neither. @privileged (chown/setuid/...) and @resources
+# (ioprio_set/sched_setaffinity/...) are pure attack surface here.
+SystemCallFilter=~@resources @privileged
 # Resource ceilings. Single-threaded, sub-millisecond renders, ~3 MB canvas +
 # the bounded glyph cache — 256 MB is generous and bounds a runaway/leak.
 MemoryMax=256M
