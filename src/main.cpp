@@ -1033,12 +1033,40 @@ void run_daemon(Renderer &renderer)
     }
 }
 
+// Pre-warm the glyph cache with a few representative cards BEFORE the accept
+// loop forks. Each per-connection child inherits the parent's cache by
+// copy-on-write, so the hot, fixed-scale glyphs — the "BILLED TO"/"TOTAL
+// PAYABLE" labels, the date, common Latin/digits — are already rasterised and
+// shared, and no child re-pays for them. (A child's own additions are lost on
+// exit, which is fine: those are the per-name glyphs anyway.) This buys back
+// most of the cross-request cache the fork model gives up.
+static void prewarm(Renderer &r)
+{
+    struct Sample
+    {
+        const char *name, *amount, *date;
+    };
+    static const Sample samples[] = {
+        {"Acme Industries Private Limited", "1234567", "2026-09-01"},
+        {"Zeta Traders LLP", "999", "2026-01-15"},
+        {"A", "50000000", "2026-12-31"},
+    };
+    for (const auto &s : samples)
+    {
+        std::string nm = s.name, amt = s.amount;
+        std::string dt = format_date_display(s.date);
+        const Theme &t = theme_for_amount(parse_amount_to_paise(amt.c_str()));
+        (void)r.render(nm, amt, dt, t);
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 int main()
 {
     Renderer r;
     if (!r.init())
         return 1;
+    prewarm(r);
     run_daemon(r);
     return 0;
 }
