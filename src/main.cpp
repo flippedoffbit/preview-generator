@@ -628,11 +628,22 @@ static void sanitize_field(std::string &s, size_t max_bytes)
     s.swap(out);
 }
 
+// Hard input-length caps, grounded in what the card can PHYSICALLY render rather
+// than in some round number. The name area is NAME_MAX_W wide; the font auto-fits
+// DOWN to NAME_SZ_MIN and is then ellipsised by fit_or_truncate, so it holds only
+// ~40-45 glyphs at the smallest size. 128 bytes sits comfortably above that for
+// any script — so the visible cut is always the ellipsis, never this hard cap —
+// while still being a quarter of the old limit, which bounds the glyph
+// measure/fit work a hostile 5000-char name would otherwise cost. The amount is a
+// paise integer (20 digits is already 10^18 rupees); the date is an ISO-ish
+// string that format_date_display expands. Anything longer we literally cannot
+// show, so we refuse to spend a single raster cycle on it — truncation upstream,
+// ellipsis at draw.
 static void bound_inputs(std::string &name, std::string &amount, std::string &date)
 {
-    sanitize_field(name, 256);
-    sanitize_field(amount, 40);
-    sanitize_field(date, 64);
+    sanitize_field(name, 128);
+    sanitize_field(amount, 20);
+    sanitize_field(date, 24);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
