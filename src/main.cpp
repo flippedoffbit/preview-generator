@@ -127,6 +127,51 @@ struct Canvas
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// UTF-8 — one validated decoder for all untrusted text
+// ─────────────────────────────────────────────────────────────────────────────
+// Decode one Unicode scalar from [p, end); advance p past what it consumed.
+// Returns U+FFFD (REPLACEMENT CHARACTER) for every malformed, overlong,
+// surrogate, or out-of-range sequence, consuming at least one byte on error so a
+// hostile string always makes progress and can neither stall nor be read past
+// `end`. This replaces the old ad-hoc decoder that understood only ₹ and fed
+// every other multibyte byte through as a raw 0x80–0xFF "code point": that both
+// garbled real Unicode names and was exactly the kind of unchecked byte-poking a
+// crafted name could probe. The clamp to <= U+10FFFF keeps the value in range
+// for stbtt, which returns an empty glyph for anything the font lacks.
+static uint32_t next_utf8(const char *&p, const char *end)
+{
+    if (p >= end)
+        return 0xFFFD;
+    unsigned char b0 = (unsigned char)*p++;
+    if (b0 < 0x80)
+        return b0; // ASCII fast path
+
+    uint32_t cp;
+    int need;
+    if ((b0 & 0xE0) == 0xC0) { cp = b0 & 0x1F; need = 1; }
+    else if ((b0 & 0xF0) == 0xE0) { cp = b0 & 0x0F; need = 2; }
+    else if ((b0 & 0xF8) == 0xF0) { cp = b0 & 0x07; need = 3; }
+    else return 0xFFFD; // stray continuation byte or illegal 5/6-byte lead
+
+    for (int i = 0; i < need; ++i)
+    {
+        if (p >= end)
+            return 0xFFFD; // truncated at end of input
+        unsigned char b = (unsigned char)*p;
+        if ((b & 0xC0) != 0x80)
+            return 0xFFFD; // not a continuation — resync WITHOUT consuming it
+        cp = (cp << 6) | (uint32_t)(b & 0x3F);
+        ++p;
+    }
+
+    static const uint32_t min_cp[4] = {0, 0x80, 0x800, 0x10000};
+    if (cp < min_cp[need])       return 0xFFFD; // overlong encoding
+    if (cp > 0x10FFFF)           return 0xFFFD; // outside Unicode
+    if (cp >= 0xD800 && cp <= 0xDFFF) return 0xFFFD; // UTF-16 surrogate half
+    return cp;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Font — thin wrapper around stbtt
 // ─────────────────────────────────────────────────────────────────────────────
 struct Font
@@ -157,17 +202,11 @@ struct Font
     {
         int baseline = y + (int)(ascent * scale);
         int cx = x;
-        for (const char *p = text; *p; ++p)
+        const char *p = text;
+        const char *end = text + std::strlen(text);
+        while (p < end)
         {
-            unsigned cp = (unsigned char)*p;
-
-            // basic UTF-8 decode for ₹ (U+20B9 = 0xE2 0x82 0xB9)
-            if (cp == 0xE2 && (unsigned char)*(p + 1) == 0x82 && (unsigned char)*(p + 2) == 0xB9)
-            {
-                cp = 0x20B9;
-                p += 2;
-            }
-
+            uint32_t cp = next_utf8(p, end);
             const GlyphBitmap &g = glyph_get(&info, (int)cp, scale);
             if (!g.data.empty())
                 canvas.blit_glyph(g.data.data(), g.w, g.h,
@@ -181,14 +220,11 @@ struct Font
     int measure(const char *text, float letter_spacing = 0.f) const
     {
         int cx = 0;
-        for (const char *p = text; *p; ++p)
+        const char *p = text;
+        const char *end = text + std::strlen(text);
+        while (p < end)
         {
-            unsigned cp = (unsigned char)*p;
-            if (cp == 0xE2 && (unsigned char)*(p + 1) == 0x82 && (unsigned char)*(p + 2) == 0xB9)
-            {
-                cp = 0x20B9;
-                p += 2;
-            }
+            uint32_t cp = next_utf8(p, end);
             const GlyphBitmap &g = glyph_get(&info, (int)cp, scale);
             cx += (int)(g.advance_f + letter_spacing);
         }
@@ -574,14 +610,29 @@ struct Renderer
 // is a slow-render DoS and needless exposure of stb_truetype to attacker length,
 // and the card only shows what fits anyway. Truncation, not rejection — a long
 // name still renders (fitted/ellipsised), just bounded.
+// Cap the byte length (a DoS bound on glyph work per request) and drop C0 control
+// bytes + DEL. Newlines, tabs and NULs have no place on a one-line card and only
+// perturb layout; everything >= 0x20 is kept and the UTF-8 decoder validates the
+// multibyte sequences at draw time. Truncation, not rejection — a long name still
+// renders (fitted/ellipsised). A sequence cut mid-way by the byte cap is harmless:
+// next_utf8 yields a single U+FFFD at the boundary and never over-reads.
+static void sanitize_field(std::string &s, size_t max_bytes)
+{
+    if (s.size() > max_bytes)
+        s.resize(max_bytes);
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s)
+        if (c >= 0x20 && c != 0x7F)
+            out.push_back((char)c);
+    s.swap(out);
+}
+
 static void bound_inputs(std::string &name, std::string &amount, std::string &date)
 {
-    if (name.size() > 256)
-        name.resize(256);
-    if (amount.size() > 40)
-        amount.resize(40);
-    if (date.size() > 64)
-        date.resize(64);
+    sanitize_field(name, 256);
+    sanitize_field(amount, 40);
+    sanitize_field(date, 64);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -761,16 +812,10 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
                              : theme_by_id(theme_id.c_str());
 
     date = format_date_display(date);
-    printf("[fcgi] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
-           name.c_str(), amount.c_str(), date.c_str(), theme.id);
-    fflush(stdout);
-
-    auto t_start = std::chrono::steady_clock::now();
+    // No per-request logging: this is a hot path serving untrusted input, a log
+    // line per card is wasted I/O (and, in a long-lived process, would sit in a
+    // never-flushed stdout buffer). Only startup and errors are logged.
     auto png = renderer.render(name, amount, date, theme);
-    auto t_end = std::chrono::steady_clock::now();
-    uint32_t render_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-    printf("[render] %u µs  (%.2f ms)\n", render_us, render_us / 1000.f);
-    fflush(stdout);
 
     // STDOUT: headers + body (chunk if > 65535)
     char hdrs[256];
@@ -879,16 +924,7 @@ static void handle_client_http(int cli, Renderer &renderer)
                              : theme_by_id(theme_id.c_str());
 
     date = format_date_display(date);
-    printf("[http] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
-           name.c_str(), amount.c_str(), date.c_str(), theme.id);
-    fflush(stdout);
-
-    auto t_start = std::chrono::steady_clock::now();
     auto png = renderer.render(name, amount, date, theme);
-    auto t_end = std::chrono::steady_clock::now();
-    uint32_t render_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-    printf("[render] %u µs  (%.2f ms)\n", render_us, render_us / 1000.f);
-    fflush(stdout);
 
     char hdr[256];
     int hl = snprintf(hdr, sizeof(hdr),
@@ -987,7 +1023,10 @@ void run_daemon(Renderer &renderer)
         perror("bind");
         return;
     }
-    listen(srv, 8);
+    // A generous backlog: this daemon serves connections sequentially in one
+    // long-lived process (no fork, no threads), so a burst of link-unfurls queues
+    // in the kernel while each ~15 ms render completes rather than being refused.
+    listen(srv, 128);
 
 #if defined(PROTO_FCGI)
     printf("[ok] listening on %s  [FCGI]\n", sock);
@@ -998,48 +1037,50 @@ void run_daemon(Renderer &renderer)
 #endif
     fflush(stdout);
 
-    // Children are auto-reaped (SIG_IGN on SIGCHLD -> no zombies); we never wait
-    // on one — it exists only to contain a single connection.
-    signal(SIGCHLD, SIG_IGN);
-
+    // ONE long-lived process, connections served sequentially. We deliberately do
+    // NOT fork per connection: a fork-per-request model turns "send a malformed
+    // name" into a fork + page-table setup + crash + stack-unwind + reap cycle we
+    // pay for and the attacker does not — a cheap way to spin up a storm of
+    // processes whose only job is to die. The defence here is PREVENTION, not
+    // containment: the parse path is made total (validated UTF-8 in Font::draw,
+    // every raster write clipped in Canvas, inputs bounded in bound_inputs) so no
+    // input reaches undefined behaviour, and the catch below converts any C++
+    // exception (bad_alloc, length_error, ...) into a dropped request instead of
+    // a std::terminate. The process stays up; the glyph cache persists across
+    // requests instead of being discarded with every child; the systemd sandbox
+    // plus Restart=always remain the backstop for a genuine (non-input) fault.
     while (true)
     {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0)
             continue;
 
-        // FORK PER CONNECTION — the fault-tolerance boundary. The child renders
-        // this one connection and exits; a shaper segfault on a crafted name, an
-        // OOM, or an uncaught exception dies WITH the child while the daemon keeps
-        // serving, so one bad input can no longer crash-loop the service. A fork
-        // is ~tens of µs against a multi-ms render — the trade the product wants.
-        pid_t pid = fork();
-        if (pid == 0)
+        try
         {
-            close(srv);
             handle_client(cli, renderer);
-            close(cli);
-            _exit(0);
         }
-        if (pid < 0)
+        catch (const std::exception &e)
         {
-            // fork failed (box under memory/PID pressure): serve in-process
-            // rather than drop the request. A crash here would take the daemon
-            // down, but a box that cannot fork is already in trouble.
-            perror("fork");
-            handle_client(cli, renderer);
+            // A malformed request must never take the daemon down. Log for the
+            // operator, drop this one connection (nginx returns 502 for it), serve
+            // the next. Anything reaching here is an allocation/size failure, not a
+            // memory-safety bug — those are prevented upstream, not caught.
+            fprintf(stderr, "[err] handler exception: %s\n", e.what());
+        }
+        catch (...)
+        {
+            fprintf(stderr, "[err] handler exception (non-std)\n");
         }
         close(cli);
     }
 }
 
-// Pre-warm the glyph cache with a few representative cards BEFORE the accept
-// loop forks. Each per-connection child inherits the parent's cache by
-// copy-on-write, so the hot, fixed-scale glyphs — the "BILLED TO"/"TOTAL
-// PAYABLE" labels, the date, common Latin/digits — are already rasterised and
-// shared, and no child re-pays for them. (A child's own additions are lost on
-// exit, which is fine: those are the per-name glyphs anyway.) This buys back
-// most of the cross-request cache the fork model gives up.
+// Pre-warm the glyph cache with a few representative cards BEFORE the accept loop
+// starts, so the first real request is not cold. The hot, fixed-scale glyphs —
+// the "BILLED TO"/"TOTAL PAYABLE" labels, the date, common Latin/digits — are
+// rasterised once here and, because this is now a single long-lived process,
+// persist in the cache for the daemon's whole life (the bounded LRU-ish clear in
+// glyph_get is the only thing that ever evicts them).
 static void prewarm(Renderer &r)
 {
     struct Sample
