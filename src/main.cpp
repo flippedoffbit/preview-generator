@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 #include <cmath>
 #include <vector>
@@ -372,6 +373,13 @@ struct Renderer
     Font dmmono;   // labels, date, amount digits
     Font inter;    // rupee symbol (clean glyph)
 
+    // The canvas is allocated ONCE and reused across every render. The daemon
+    // is single-threaded (one render in flight), the size is fixed, and
+    // `render()` clears it with `fill()` before drawing — so there is no reason
+    // to malloc/free ~3 MB of RGBA per request. The PNG output buffer is the
+    // only per-request allocation left, and it is reserved up front.
+    Canvas canvas{IMG_W, IMG_H};
+
     bool init()
     {
         fpng::fpng_init();
@@ -414,7 +422,8 @@ struct Renderer
 #define PROF_LAP(label) (void)0
         // #endif
 
-        Canvas canvas(IMG_W, IMG_H);
+        // Reuse the member canvas (allocated once); `fill` clears last render.
+        Canvas &canvas = this->canvas;
 
         // ── 1. background ─────────────────────────────────────────────────────
         canvas.fill(theme.bg);
@@ -519,6 +528,9 @@ struct Renderer
 
         // ── 11. encode PNG ─────────────────────────────────────────────────────
         std::vector<uint8_t> out;
+        // A flat-colour card of this size PNG-compresses to well under this;
+        // reserving up front spares fpng its incremental regrowth.
+        out.reserve(96 * 1024);
         fpng::fpng_encode_image_to_memory(canvas.px.data(), IMG_W, IMG_H, CH, out);
         PROF_LAP("png encode");
 
@@ -856,7 +868,14 @@ static void handle_client_http(int cli, Renderer &renderer)
 // ─────────────────────────────────────────────────────────────────────────────
 void run_daemon(Renderer &renderer)
 {
-    unlink(SOCKET_PATH);
+    // Socket path from the environment, so the hardened unit can place it under
+    // a RuntimeDirectory (/run/billpreview/) instead of world-writable /tmp;
+    // defaults to SOCKET_PATH for the dev harness and back-compat.
+    const char *sock = getenv("BILLPREVIEW_SOCKET");
+    if (!sock || !*sock)
+        sock = SOCKET_PATH;
+
+    unlink(sock);
     int srv = socket(AF_UNIX, SOCK_STREAM, 0);
     if (srv < 0)
     {
@@ -866,7 +885,7 @@ void run_daemon(Renderer &renderer)
 
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1);
 
     if (bind(srv, (sockaddr *)&addr, sizeof(addr)) < 0)
     {
@@ -876,11 +895,11 @@ void run_daemon(Renderer &renderer)
     listen(srv, 8);
 
 #if defined(PROTO_FCGI)
-    printf("[ok] listening on %s  [FCGI]\n", SOCKET_PATH);
+    printf("[ok] listening on %s  [FCGI]\n", sock);
 #elif defined(PROTO_HTTP)
-    printf("[ok] listening on %s  [HTTP]\n", SOCKET_PATH);
+    printf("[ok] listening on %s  [HTTP]\n", sock);
 #else
-    printf("[ok] listening on %s  [UDS]\n", SOCKET_PATH);
+    printf("[ok] listening on %s  [UDS]\n", sock);
 #endif
     fflush(stdout);
 

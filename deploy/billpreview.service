@@ -1,0 +1,90 @@
+# billpreview — the Open Graph card renderer, as a HARDENED system unit.
+#
+# This replaces the old per-user systemd unit (~/.config/systemd/user/, socket in
+# world-writable /tmp). billpreview renders UNTRUSTED customer text (company
+# names) through a C++ font shaper (stb_truetype) — it is memory-UNSAFE by
+# language, so the process itself is the attack surface and the sandbox is the
+# real containment. Modelled on billpdf's unit (exposure ~0.8/10).
+#
+# Coordinates with TWO other changes:
+#   1. nginx: fastcgi_pass unix:/run/billpreview/billpreview.sock (was
+#      /tmp/billpreview.sock). Update the vhost and reload.
+#   2. the binary: install the FCGI release build to /usr/local/bin/billpreview.
+#      The fonts are EMBEDDED (xxd headers), so it reads nothing from disk — which
+#      is what lets the FS view below be the binary alone.
+#
+# Install:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin billpreview
+#   sudo usermod -aG billpreview www-data     # nginx opens the group socket
+#   sudo systemctl restart nginx              # RELOAD keeps old groups; restart
+#   sudo install -Dm0755 billpreview-x86_64-...-fcgi /usr/local/bin/billpreview
+#   sudo cp billpreview.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now billpreview
+
+[Unit]
+Description=billpreview Open Graph card renderer
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/billpreview
+Environment=BILLPREVIEW_SOCKET=/run/billpreview/billpreview.sock
+
+User=billpreview
+Group=www-data
+# 0007 so the socket billpreview creates is group-rw for nginx (www-data).
+UMask=0007
+RuntimeDirectory=billpreview
+RuntimeDirectoryMode=0750
+
+# --- Sandbox. Untrusted text through a C++ shaper, no network, fonts embedded.
+NoNewPrivileges=yes
+# Drop every capability.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# No outbound calls at all — a private network namespace with only loopback. The
+# AF_UNIX socket is a filesystem object, so nginx still reaches it across the ns.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+# Read isolation: the binary is a static FCGI build with the fonts embedded, so
+# it reads NOTHING from disk — blank the whole filesystem view and bind back only
+# the binary (needed at execve; after exec it pages from the held inode). A
+# compromised billpreview sees a tree with nothing but its own binary.
+TemporaryFileSystem=/:ro
+BindReadOnlyPaths=/usr/local/bin/billpreview
+MountAPIVFS=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+KeyringMode=private
+# No JIT in the graph (stb_truetype + fpng are AOT), so deny write+exec mappings.
+MemoryDenyWriteExecute=yes
+# seccomp allowlist — sockets, epoll/poll, futex, file I/O, mmap. Tighter than
+# docker's default. A violation kills the process; Restart brings it back.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# Resource ceilings. Single-threaded, sub-millisecond renders, ~3 MB canvas +
+# the bounded glyph cache — 256 MB is generous and bounds a runaway/leak.
+MemoryMax=256M
+TasksMax=32
+LimitNOFILE=1024
+
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=multi-user.target

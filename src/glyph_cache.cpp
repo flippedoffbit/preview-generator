@@ -17,6 +17,17 @@ const GlyphBitmap &glyph_get(const stbtt_fontinfo *font, int codepoint, float sc
 {
     GlyphKey key{font, codepoint, scale};
 
+    // Bound this process-lifetime cache. The (font, codepoint, scale) space is
+    // finite but large — auto-fit measures every glyph at ~40 scales and
+    // untrusted company names vary the codepoints — so without a ceiling it
+    // grows for the daemon's whole life. Clear wholesale when full: correctness
+    // is unaffected (the hot glyphs re-rasterise on demand) and every reference
+    // this function returns is to a POST-clear entry, so none can dangle. The
+    // unit's MemoryMax is the hard backstop.
+    static constexpr size_t GLYPH_CACHE_MAX = 8192;
+    if (g_glyph_cache.size() >= GLYPH_CACHE_MAX)
+        g_glyph_cache.clear();
+
     auto it = g_glyph_cache.find(key);
     if (it != g_glyph_cache.end())
         return it->second;
