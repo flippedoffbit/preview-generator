@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <csignal>
 
 // ── Vendor ────────────────────────────────────────────────────────────────────
 #include "vendor/stb_truetype.h"
@@ -568,6 +569,21 @@ struct Renderer
 // UDS daemon
 // protocol: client sends  "name\tamount\tdate\n"
 //           server replies <4 bytes LE PNG size><4 bytes LE render_us><PNG bytes>
+// Cap untrusted inputs before they reach the C++ font shaper — shared by every
+// protocol backend, so it lives OUTSIDE their #if guards. A 64 KB company name
+// is a slow-render DoS and needless exposure of stb_truetype to attacker length,
+// and the card only shows what fits anyway. Truncation, not rejection — a long
+// name still renders (fitted/ellipsised), just bounded.
+static void bound_inputs(std::string &name, std::string &amount, std::string &date)
+{
+    if (name.size() > 256)
+        name.resize(256);
+    if (amount.size() > 40)
+        amount.resize(40);
+    if (date.size() > 64)
+        date.resize(64);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Protocol backends ─────────────────────────────────────────────────────────
 // Build with:
@@ -738,6 +754,7 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
 
     if (name.empty())
         return;
+    bound_inputs(name, amount, date);
 
     const Theme &theme = theme_id.empty()
                              ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
@@ -855,6 +872,7 @@ static void handle_client_http(int cli, Renderer &renderer)
         write(cli, r400, strlen(r400));
         return;
     }
+    bound_inputs(name, amount, date);
 
     const Theme &theme = theme_id.empty()
                              ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
@@ -882,8 +900,66 @@ static void handle_client_http(int cli, Renderer &renderer)
 
 #endif
 
+#if !defined(PROTO_FCGI) && !defined(PROTO_HTTP)
+// Legacy tab-delimited UDS protocol, extracted into a function so the fork loop
+// wraps it like the others. Does NOT close cli — the caller does.
+static void handle_client_tab(int cli, Renderer &renderer)
+{
+    char buf[512] = {};
+    read(cli, buf, sizeof(buf) - 1);
+    std::string req(buf);
+    auto t1 = req.find('\t');
+    auto t2 = req.find('\t', t1 + 1);
+    if (t1 == std::string::npos || t2 == std::string::npos)
+        return;
+
+    std::string name = req.substr(0, t1);
+    std::string amount = req.substr(t1 + 1, t2 - t1 - 1);
+    std::string date, theme_id;
+    auto t3 = req.find('\t', t2 + 1);
+    if (t3 == std::string::npos)
+    {
+        date = req.substr(t2 + 1);
+        if (!date.empty() && date.back() == '\n')
+            date.pop_back();
+    }
+    else
+    {
+        date = req.substr(t2 + 1, t3 - t2 - 1);
+        theme_id = req.substr(t3 + 1);
+        if (!theme_id.empty() && theme_id.back() == '\n')
+            theme_id.pop_back();
+    }
+
+    bound_inputs(name, amount, date);
+    const Theme &theme = theme_id.empty()
+                             ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
+                             : theme_by_id(theme_id.c_str());
+
+    date = format_date_display(date);
+    auto png = renderer.render(name, amount, date, theme);
+    uint32_t sz = (uint32_t)png.size();
+    uint32_t render_us = 0;
+    write(cli, &sz, 4);
+    write(cli, &render_us, 4);
+    write(cli, png.data(), png.size());
+}
+#endif
+
+// Protocol dispatch, selected at compile time.
+static void handle_client(int cli, Renderer &renderer)
+{
+#if defined(PROTO_FCGI)
+    handle_client_fcgi(cli, renderer);
+#elif defined(PROTO_HTTP)
+    handle_client_http(cli, renderer);
+#else
+    handle_client_tab(cli, renderer);
+#endif
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// run_daemon — unchanged signature, protocol selected at compile time
+// run_daemon — forks per connection so one bad input cannot crash the daemon
 // ─────────────────────────────────────────────────────────────────────────────
 void run_daemon(Renderer &renderer)
 {
@@ -922,73 +998,38 @@ void run_daemon(Renderer &renderer)
 #endif
     fflush(stdout);
 
+    // Children are auto-reaped (SIG_IGN on SIGCHLD -> no zombies); we never wait
+    // on one — it exists only to contain a single connection.
+    signal(SIGCHLD, SIG_IGN);
+
     while (true)
     {
         int cli = accept(srv, nullptr, nullptr);
         if (cli < 0)
             continue;
 
-#if defined(PROTO_FCGI)
-        handle_client_fcgi(cli, renderer);
-        close(cli);
-
-#elif defined(PROTO_HTTP)
-        handle_client_http(cli, renderer);
-        close(cli);
-
-#else
-        // ── legacy tab-delimited UDS (original) ──────────────────────────────
-        char buf[512] = {};
-        read(cli, buf, sizeof(buf) - 1);
-        std::string req(buf);
-        auto t1 = req.find('\t');
-        auto t2 = req.find('\t', t1 + 1);
-        if (t1 == std::string::npos || t2 == std::string::npos)
+        // FORK PER CONNECTION — the fault-tolerance boundary. The child renders
+        // this one connection and exits; a shaper segfault on a crafted name, an
+        // OOM, or an uncaught exception dies WITH the child while the daemon keeps
+        // serving, so one bad input can no longer crash-loop the service. A fork
+        // is ~tens of µs against a multi-ms render — the trade the product wants.
+        pid_t pid = fork();
+        if (pid == 0)
         {
+            close(srv);
+            handle_client(cli, renderer);
             close(cli);
-            continue;
+            _exit(0);
         }
-
-        std::string name = req.substr(0, t1);
-        std::string amount = req.substr(t1 + 1, t2 - t1 - 1);
-        std::string date, theme_id;
-        auto t3 = req.find('\t', t2 + 1);
-        if (t3 == std::string::npos)
+        if (pid < 0)
         {
-            date = req.substr(t2 + 1);
-            if (!date.empty() && date.back() == '\n')
-                date.pop_back();
+            // fork failed (box under memory/PID pressure): serve in-process
+            // rather than drop the request. A crash here would take the daemon
+            // down, but a box that cannot fork is already in trouble.
+            perror("fork");
+            handle_client(cli, renderer);
         }
-        else
-        {
-            date = req.substr(t2 + 1, t3 - t2 - 1);
-            theme_id = req.substr(t3 + 1);
-            if (!theme_id.empty() && theme_id.back() == '\n')
-                theme_id.pop_back();
-        }
-
-        const Theme &theme = theme_id.empty()
-                                 ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
-                                 : theme_by_id(theme_id.c_str());
-
-        date = format_date_display(date);
-        printf("[req] name=%-30s  amount=%-12s  date=%-12s  theme=%s\n",
-               name.c_str(), amount.c_str(), date.c_str(), theme.id);
-        fflush(stdout);
-
-        auto t_start = std::chrono::steady_clock::now();
-        auto png = renderer.render(name, amount, date, theme);
-        auto t_end = std::chrono::steady_clock::now();
-        uint32_t render_us = (uint32_t)std::chrono::duration_cast<std::chrono::microseconds>(t_end - t_start).count();
-        printf("[render] %u µs  (%.2f ms)\n", render_us, render_us / 1000.f);
-        fflush(stdout);
-
-        uint32_t sz = (uint32_t)png.size();
-        write(cli, &sz, 4);
-        write(cli, &render_us, 4);
-        write(cli, png.data(), png.size());
         close(cli);
-#endif
     }
 }
 
