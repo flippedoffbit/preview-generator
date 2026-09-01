@@ -27,9 +27,28 @@
 #include "glyph_cache.h"
 
 // ── Canvas size ───────────────────────────────────────────────────────────────
-static constexpr int IMG_W = 1200;
-static constexpr int IMG_H = 630;
+// The design is authored at 1200x630 (the OG-card reference — the universal
+// minimum for WhatsApp/iMessage/Google Messages). BILLPREVIEW_SCALE rescales the
+// WHOLE layout — canvas, positions, font sizes — at build time, trading softness
+// for render + PNG-encode cost (both fall with the pixel count). The 1.91:1
+// ratio is preserved, so previews still crop correctly.
+//
+//   -DBILLPREVIEW_SCALE=1.0    -> 1200x630  (default, crispest)
+//   -DBILLPREVIEW_SCALE=0.667  ->  800x420
+//   -DBILLPREVIEW_SCALE=0.5    ->  600x315  (~1/4 the pixels, softer)
+#ifndef BILLPREVIEW_SCALE
+#define BILLPREVIEW_SCALE 1.0f
+#endif
+static constexpr float SCALE = BILLPREVIEW_SCALE;
+static constexpr int IMG_W = (int)(1200 * SCALE + 0.5f);
+static constexpr int IMG_H = (int)(630 * SCALE + 0.5f);
 static constexpr int CH = 4; // RGBA
+
+// design-space (1200x630) pixel -> render-space. Every layout literal goes
+// through these so one SCALE knob moves the whole card. Ratios (e.g. the rupee's
+// 0.7 of the digit size) are NOT scaled — they are already relative.
+static constexpr int SPX(float v) { return (int)(v * SCALE + 0.5f); }
+static constexpr float SF(float v) { return v * SCALE; }
 
 // Palette is now fully driven by the Theme system (see src/themes.h / themes.cpp).
 // Themes are selected per-request via the optional 4th tab field in the protocol
@@ -432,24 +451,24 @@ struct Renderer
         // NOTE: top accent bar removed — embedding apps control their own chrome.
 
         // ── layout constants ──────────────────────────────────────────────────
-        const int LEFT = 80;
-        const int RIGHT = IMG_W - 80; // for right-aligned date
+        const int LEFT = SPX(80);
+        const int RIGHT = IMG_W - SPX(80); // for right-aligned date
         int y = 0;
 
         // ── 3. split name into base + optional business suffix ────────────────
         auto [base_name, suffix] = split_business_suffix(name);
 
         // ── 4. sub-label: "BILLED TO" (larger for legibility)
-        dmmono.set_size(28.f);
-        y = 72;
-        dmmono.draw(canvas, "BILLED TO", LEFT, y, theme.sub_label, 3.5f);
+        dmmono.set_size(SF(28.f));
+        y = SPX(72);
+        dmmono.draw(canvas, "BILLED TO", LEFT, y, theme.sub_label, SF(3.5f));
         PROF_LAP("BILLED TO");
 
         // ── 5. name (Fraunces Bold, auto-fitted) — allow larger max size
         const int NAME_MAX_W = RIGHT - LEFT;
-        const float NAME_SZ_MAX = 110.f;
-        const float NAME_SZ_MIN = 48.f;
-        const float NAME_SZ_STEP = 4.f;
+        const float NAME_SZ_MAX = SF(110.f);
+        const float NAME_SZ_MIN = SF(48.f);
+        const float NAME_SZ_STEP = SF(4.f);
 
         float name_sz = NAME_SZ_MAX;
         fraunces.set_size(name_sz);
@@ -460,7 +479,7 @@ struct Renderer
         }
         std::string display_name = fit_or_truncate(fraunces, base_name, NAME_MAX_W);
 
-        y = 120;
+        y = SPX(120);
         fraunces.draw(canvas, display_name.c_str(), LEFT, y, theme.name);
         PROF_LAP("name draw");
 
@@ -471,9 +490,9 @@ struct Renderer
         // ── 6. business suffix label (if present)
         if (!suffix.empty())
         {
-            dmmono.set_size(26.f);
-            int suf_y = name_bottom + 8;
-            dmmono.draw(canvas, suffix.c_str(), LEFT, suf_y, theme.sub_name, 1.5f);
+            dmmono.set_size(SF(26.f));
+            int suf_y = name_bottom + SPX(8);
+            dmmono.draw(canvas, suffix.c_str(), LEFT, suf_y, theme.sub_name, SF(1.5f));
             PROF_LAP("suffix draw");
             int suf_baseline = suf_y + (int)(dmmono.ascent * dmmono.scale);
             int suf_bottom = suf_baseline + (int)(std::abs(dmmono.descent) * dmmono.scale);
@@ -482,21 +501,21 @@ struct Renderer
         }
 
         // ── 7. divider line (moved up to reduce empty space)
-        int divider_y = name_bottom + 36;
-        canvas.rect(LEFT, divider_y, RIGHT - LEFT, 1, theme.divider);
+        int divider_y = name_bottom + SPX(36);
+        canvas.rect(LEFT, divider_y, RIGHT - LEFT, std::max(1, SPX(1)), theme.divider);
 
         // ── 8. "TOTAL PAYABLE" label (larger)
-        dmmono.set_size(26.f);
-        int total_label_y = divider_y + 24;
-        dmmono.draw(canvas, "TOTAL PAYABLE", LEFT, total_label_y, theme.amt_label, 3.5f);
+        dmmono.set_size(SF(26.f));
+        int total_label_y = divider_y + SPX(24);
+        dmmono.draw(canvas, "TOTAL PAYABLE", LEFT, total_label_y, theme.amt_label, SF(3.5f));
         PROF_LAP("TOTAL PAYABLE");
 
         // ── 9. rupee symbol + amount — dynamic sizing (grow, then shrink to fit)
-        const float AMOUNT_SZ_MAX = 160.f;
-        const float AMOUNT_SZ_MIN = 36.f;
-        const float AMOUNT_SZ_STEP = 4.f;
-        const float RUPEE_RATIO = 0.7f; // rupee glyph ~70% of amount digit size
-        const int AMOUNT_SPACING = 8;
+        const float AMOUNT_SZ_MAX = SF(160.f);
+        const float AMOUNT_SZ_MIN = SF(36.f);
+        const float AMOUNT_SZ_STEP = SF(4.f);
+        const float RUPEE_RATIO = 0.7f; // rupee glyph ~70% of amount digit size — a ratio, unscaled
+        const int AMOUNT_SPACING = SPX(8);
 
         float amt_sz = AMOUNT_SZ_MAX;
         int total_w = 0;
@@ -512,7 +531,7 @@ struct Renderer
             amt_sz -= AMOUNT_SZ_STEP;
         }
 
-        int amount_y = total_label_y + 36;
+        int amount_y = total_label_y + SPX(36);
         int amount_baseline = amount_y + (int)(dmmono.ascent * dmmono.scale);
         int rupee_top = amount_baseline - (int)(inter.ascent * inter.scale);
         int rupee_end = inter.draw(canvas, "₹", LEFT, rupee_top, theme.rupee);
@@ -520,8 +539,8 @@ struct Renderer
         PROF_LAP("rupee + amount");
 
         // ── 10. date — larger, bottom-right
-        dmmono.set_size(52.f);
-        int date_y = IMG_H - 64;
+        dmmono.set_size(SF(52.f));
+        int date_y = IMG_H - SPX(64);
         int date_w = dmmono.measure(date.c_str());
         dmmono.draw(canvas, date.c_str(), RIGHT - date_w, date_y, theme.date);
         PROF_LAP("date");

@@ -39,10 +39,18 @@ HDR_DMMONO    := $(GEN_DIR)/font_dmmono.h
 HDR_INTER     := $(GEN_DIR)/font_inter.h
 GENERATED     := $(HDR_FRAUNCES) $(HDR_DMMONO) $(HDR_INTER)
 
+# ── Card resolution ───────────────────────────────────────────────────────────
+# Rescale the WHOLE card at build time — canvas, layout AND font sizes — trading
+# softness for render + PNG-encode cost (both fall with the pixel count). The
+# 1.91:1 ratio is preserved. 1.0 = 1200x630 (default, crispest); 0.667 = 800x420;
+# 0.5 = 600x315 (~4x faster render, ~half the PNG). Build with e.g.
+# `make mac SCALE=0.5` or `make release SCALE=0.5`.
+SCALE    ?= 1.0
+
 # ── Common flags (all builds) ─────────────────────────────────────────────────
 CXXSTD   := -std=c++20
 WARNINGS := -Wall -Wextra -Wno-unused-parameter
-INCLUDES := -I$(GEN_DIR) -I$(VENDOR_DIR) -I$(SRC_DIR)
+INCLUDES := -I$(GEN_DIR) -I$(VENDOR_DIR) -I$(SRC_DIR) -DBILLPREVIEW_SCALE=$(SCALE)f
 
 # ── Dev flags ─────────────────────────────────────────────────────────────────
 ifeq ($(HOST_ARCH), arm64)
