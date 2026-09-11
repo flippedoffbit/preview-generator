@@ -798,6 +798,31 @@ struct Renderer
                         fit_or_truncate_tracked(dmmono, label_tail, RIGHT - LEFT, SF(3.5f)).c_str(),
                         LEFT, y, theme.sub_label, SF(3.5f));
         }
+
+        // The date shares that line, right-aligned, and says what it IS.
+        //
+        // It lived in the bottom-right corner of the canvas, then briefly on
+        // the total's line — which works until the total's own figure moves to
+        // the right margin to sit under a column of line items, and the two
+        // collide. The header line has an empty right half in every layout, so
+        // that is where it goes.
+        //
+        // "DUE" is not decoration. Unlabelled, a date in the corner of an
+        // invoice reads as the invoice's date to most people, and this one is
+        // the date the money is owed by. The card has room to say so.
+        if (!date.empty())
+        {
+            char due[64];
+            snprintf(due, sizeof(due), "DUE %s", date.c_str());
+            dmmono.set_size(SF(26.f));
+            int due_w = dmmono.measure(due, SF(1.5f));
+            // Drawn only if it genuinely fits beside the label. Overlapping
+            // two runs is worse than dropping the less important one, and a
+            // scaled-down date beside a fixed-size label would be the only
+            // text on the card whose size depends on the weekday.
+            if (due_w <= RIGHT - label_x - SPX(40))
+                dmmono.draw(canvas, due, RIGHT - due_w, y, theme.date, SF(1.5f));
+        }
         PROF_LAP("name label");
 
         // ── 5. name (Fraunces Bold, auto-fitted) — allow larger max size
@@ -967,29 +992,9 @@ struct Renderer
             amount_x = LEFT;
         }
         dmmono.set_size(SF(26.f));
-        int amt_label_baseline = total_label_y + (int)(dmmono.ascent * dmmono.scale);
         dmmono.draw(canvas, amt_label_text.c_str(), LEFT, total_label_y, theme.amt_label, SF(3.5f));
         PROF_LAP("amount label");
 
-        // ── 9b. the date, on the label's line rather than in the far corner
-        //
-        // It used to be pinned to the bottom of the CANVAS, which left about
-        // 110px of nothing between the figure and it — the single emptiest part
-        // of the card, and all of it below the only line that used the full
-        // width. Set beside "TOTAL PAYABLE" it reads as what it is (the date
-        // that figure is due), fills the right half of a line that was half
-        // empty, and lets the block close up under the amount.
-        //
-        // Only the invoice card has one: a booklet has several dates and says
-        // none of them.
-        if (!has_rows && !date.empty())
-        {
-            dmmono.set_size(SF(34.f));
-            int date_w = dmmono.measure(date.c_str());
-            int date_y = amt_label_baseline - (int)(dmmono.ascent * dmmono.scale);
-            dmmono.draw(canvas, date.c_str(), RIGHT - date_w, date_y, theme.date);
-            PROF_LAP("date");
-        }
 
         dmmono.set_size(amt_sz);
         inter.set_size(amt_sz * RUPEE_RATIO);
@@ -1129,9 +1134,15 @@ static CardData build_card(const CardFields &f)
     c.more_amount = f.more_amount;
     sanitize_field(c.more_amount, 20);
 
-    // Contents rows are only ever drawn for a booklet. An invoice card showing
-    // "its" three contents rows would be a card about a set of one.
-    if (c.kind != CardKind::Invoice)
+    // Contents rows on EITHER kind.
+    //
+    // They were refused on an invoice at first, on the reasoning that an
+    // invoice is not a set — which confused the layout with the thing. A bill
+    // has a contents list too: its line items, with the same shape (a label, a
+    // figure, and a remainder for what did not fit) and the same arithmetic,
+    // since `bills.amount` is the sum of its particulars' `total_price` and
+    // the database has a test that says so. What separates the kinds is the
+    // words, which is what `kind` was always for.
     {
         for (int i = 0; i < MAX_CONTENTS_ROWS; ++i)
         {
