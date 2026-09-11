@@ -36,12 +36,55 @@ Notes:
 - The release builds pass `-static` and other flags that produce fully static musl-linked executables. Use only when you need portable Linux binaries.
 - The Makefile will automatically generate header blobs for fonts found in `assets/` (via `xxd -i`) and place them into `src/gen/`.
 
+**Card kinds**
+
+One layout, three sets of words. The caller names a KIND and the daemon holds
+the labels — never the other way round: this renders untrusted text on a public,
+unauthenticated URL, and caller-supplied labels would make it a general
+text-over-image service anybody could point at anything.
+
+| `kind=` | above the name | above the figure |
+|---|---|---|
+| *(absent)*, `invoice` | `BILLED TO` | `TOTAL PAYABLE` |
+| `booklet` | `BILLED TO` | `6 INVOICES / TOTAL BILLED` |
+| `booklet-mixed` | `FROM` | `6 INVOICES / TOTAL BILLED` |
+
+`count` supplies the number and is digits-only, 1–9999; anything else drops the
+count from the label rather than printing a guess beside a real figure. An
+unknown `kind` falls back to `invoice`, for the reason `theme_by_id` falls back
+to `THEMES[0]` — a wrong-looking card beats a broken image.
+
+`booklet-mixed` exists because a set of invoices may span several
+counterparties, and there the name is the ISSUER: heading that card "BILLED TO"
+would name the sender as the debtor.
+
 **Protocol & Usage**
 
-The daemon listens on the UNIX socket `/tmp/billpreview.sock`. The simple protocol is:
+The daemon listens on the UNIX socket named by `BILLPREVIEW_SOCKET`
+(`/tmp/billpreview.sock` if unset; the live unit places it under
+`/run/billpreview/`). Three protocol backends are built from the same source —
+see the Makefile legend — and **the deployed one is FastCGI**.
 
-- Client → Server: a single request line UTF-8 string terminated by `\n`, with tab-separated fields:
-  - `name\tamount\tdate`  OR  `name\tamount\tdate\ttheme_id`  (theme_id optional)
+*FastCGI (`-DPROTO_FCGI`, what nginx `fastcgi_pass`es to):* fields arrive as
+`QUERY_STRING`, as an `application/x-www-form-urlencoded` request BODY, or
+both — the body is parsed second, so a key given twice is taken from the body.
+The body is capped at 8 KB and the excess is dropped rather than the connection,
+because a handler that stops reading mid-stream desyncs the conversation and
+nginx reports a bare 502. There is deliberately no JSON parser. A request with
+no `company` gets a real `400`, not silence.
+
+`fcgi_client.py` speaks this protocol from a shell, which is the only way to
+exercise the deployed build without standing up nginx:
+
+```
+./fcgi_client.py --sock /tmp/billpreview.sock --get 'company=Acme Ltd&amount=1000' -o card.png
+./fcgi_client.py --sock /tmp/billpreview.sock --post 'company=Acme Ltd&amount=708000&kind=booklet&count=6' -o booklet.png
+```
+
+*Legacy UDS (the default build):* a single request line terminated by `\n`,
+tab-separated, trailing fields optional:
+
+  - `name\tamount\tdate[\ttheme[\tkind[\tcount]]]`
 
 - Server → Client: binary response consisting of:
   1) 4 bytes little-endian PNG size (uint32)
@@ -201,6 +244,23 @@ The renderer chooses a theme using the following logic (see `src/themes.cpp`):
   - ≥ ₹5,00,000   → `dark-slate`
 
 The theme entries define a full palette used by the renderer (background, accent, label, name, amount colours, divider, date colour, and rupee/amount colours). Light-themed variants are also available if you explicitly select them by `theme_id`.
+
+**What it cannot draw**
+
+**Only the scripts the three bundled faces cover, which in practice means
+Latin.** The UTF-8 layer is fine — `next_utf8` is a validated decoder and an
+earlier README claim that non-ASCII text is "decoded byte-by-byte and renders as
+garbage" is wrong. What is missing is glyph COVERAGE: measured against the live
+daemon, `कावेरी हार्डवेयर Pvt Ltd` renders as correctly-sized, correctly-spaced
+empty rectangles, because Fraunces has no Devanagari.
+
+Adding a face is not the whole fix and should not be done casually. stb_truetype
+does no SHAPING — it maps codepoints to glyphs one for one — so an Indic script
+would render with unattached matras and no conjuncts: wrong in a way that looks
+plausible to a reader who does not know the script. Doing it properly means
+HarfBuzz, which is a real dependency decision for a 1.6 MB static binary under a
+0.2/10 sandbox. Until then, a name outside Latin gets boxes, and this paragraph
+is the record that it is known rather than unnoticed.
 
 **License**
 This project is released under the MIT License. See [LICENSE](LICENSE) for details.

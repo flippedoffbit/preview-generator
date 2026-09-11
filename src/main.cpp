@@ -298,6 +298,73 @@ static std::pair<std::string, std::string> split_business_suffix(const std::stri
     return {name, ""};
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Card kinds — a CLOSED vocabulary, and the words live HERE
+// ─────────────────────────────────────────────────────────────────────────────
+// A card is rendered for a public, unauthenticated URL. The tempting way to
+// support a second document type was `&label1=…&label2=…`, and it is the wrong
+// one: caller-supplied labels turn a firm-branded endpoint into a general
+// text-over-image renderer that anybody can point at anything, and every
+// scraper that fetches it caches the result. So the caller names a KIND and the
+// daemon holds the words, exactly as `theme_by_id` holds the palettes.
+//
+// An unknown kind falls back to Invoice rather than refusing — same reason
+// theme_by_id returns THEMES[0]. A card that reads as an invoice when the
+// caller mistyped is a cosmetic defect; a card that fails to render is a broken
+// image in somebody's WhatsApp thread.
+enum class CardKind
+{
+    Invoice,      // one bill: BILLED TO … / TOTAL PAYABLE …
+    Booklet,      // a set, every invoice billed to the SAME party
+    BookletMixed, // a set spanning several parties: headed by the ISSUER
+};
+
+static CardKind kind_by_id(const char *id)
+{
+    if (!id || !*id)
+        return CardKind::Invoice;
+    if (std::strcmp(id, "booklet") == 0)
+        return CardKind::Booklet;
+    if (std::strcmp(id, "booklet-mixed") == 0)
+        return CardKind::BookletMixed;
+    return CardKind::Invoice;
+}
+
+// The label above the name.
+//
+// "BILLED TO" is true of a single-party booklet — every invoice in it really is
+// billed to that one party — so it carries over unchanged. It is NOT true when
+// the set spans two counterparties, which the booklet schema permits; there the
+// name is the issuing firm and the label has to say so, or the card states
+// something false about who owes what.
+static const char *name_label_for(CardKind k)
+{
+    return k == CardKind::BookletMixed ? "FROM" : "BILLED TO";
+}
+
+// The label above the figure.
+//
+// "TOTAL PAYABLE" is a lie on a booklet the moment one of its invoices is
+// settled, and a card outlives that payment: it is cached and forwarded by
+// every app that touches it. What does NOT move is the total of the set —
+// booklet membership is frozen when the link is created (see trunk's
+// bill_link_collections.go: "a set somebody chose, not a query that keeps
+// running") — so TOTAL BILLED is a figure the card may still be asserting
+// correctly in six months, and the settled and due figures are deliberately
+// not renderable here at all.
+//
+// Written into `buf` because the booklet form carries the page count. The count
+// is dropped rather than guessed when it is absent or implausible.
+static const char *amount_label_for(CardKind k, int count, char *buf, size_t buflen)
+{
+    if (k == CardKind::Invoice)
+        return "TOTAL PAYABLE";
+    if (count <= 0)
+        return "TOTAL BILLED";
+    snprintf(buf, buflen, "%d %s / TOTAL BILLED", count, count == 1 ? "INVOICE" : "INVOICES");
+    return buf;
+}
+
 // Truncate text to fit max_w pixels, appending "…" if needed.
 static std::string fit_or_truncate(Font &font, const std::string &text, int max_w)
 {
@@ -307,6 +374,23 @@ static std::string fit_or_truncate(Font &font, const std::string &text, int max_
     while (!t.empty() && font.measure((t + "\xe2\x80\xa6").c_str()) > max_w)
         t.pop_back();
     return t + "\xe2\x80\xa6"; // UTF-8 ellipsis U+2026
+}
+
+// fit_or_truncate for a TRACKED label.
+//
+// The label faces are drawn with letter_spacing, and measure() only accounts
+// for tracking when it is told about it — so fitting a tracked string with the
+// untracked helper above under-measures it by one tracking step per character
+// and lets it run off the right edge, where blit_glyph clips it silently.
+static std::string fit_or_truncate_tracked(Font &font, const std::string &text,
+                                           int max_w, float tracking)
+{
+    if (font.measure(text.c_str(), tracking) <= max_w)
+        return text;
+    std::string t = text;
+    while (!t.empty() && font.measure((t + "\xe2\x80\xa6").c_str(), tracking) > max_w)
+        t.pop_back();
+    return t + "\xe2\x80\xa6";
 }
 
 // Normalize/format incoming date strings into a human-friendly form:
@@ -461,7 +545,9 @@ struct Renderer
     std::vector<uint8_t> render(const std::string &name,
                                 const std::string &amount,
                                 const std::string &date,
-                                const Theme &theme)
+                                const Theme &theme,
+                                CardKind kind = CardKind::Invoice,
+                                int count = 0)
     {
 // #if PROFILE
 // #define PROF_LAP(label)                                                             \
@@ -495,11 +581,11 @@ struct Renderer
         // ── 3. split name into base + optional business suffix ────────────────
         auto [base_name, suffix] = split_business_suffix(name);
 
-        // ── 4. sub-label: "BILLED TO" (larger for legibility)
+        // ── 4. sub-label: "BILLED TO" / "FROM" (larger for legibility)
         dmmono.set_size(SF(28.f));
         y = SPX(72);
-        dmmono.draw(canvas, "BILLED TO", LEFT, y, theme.sub_label, SF(3.5f));
-        PROF_LAP("BILLED TO");
+        dmmono.draw(canvas, name_label_for(kind), LEFT, y, theme.sub_label, SF(3.5f));
+        PROF_LAP("name label");
 
         // ── 5. name (Fraunces Bold, auto-fitted) — allow larger max size
         const int NAME_MAX_W = RIGHT - LEFT;
@@ -541,11 +627,22 @@ struct Renderer
         int divider_y = name_bottom + SPX(36);
         canvas.rect(LEFT, divider_y, RIGHT - LEFT, std::max(1, SPX(1)), theme.divider);
 
-        // ── 8. "TOTAL PAYABLE" label (larger)
+        // ── 8. "TOTAL PAYABLE" / "6 INVOICES / TOTAL BILLED" label (larger)
+        //
+        // Fitted rather than clipped. The longest label this can produce today
+        // is "9999 INVOICES / TOTAL BILLED" and it fits with room to spare, so
+        // the fit never fires — it is here because the label is the string most
+        // likely to grow (a new kind, a longer word), and the failure it
+        // prevents is silent: Canvas::blit_glyph clips glyph-by-glyph without
+        // complaint, so an overlong label would leave a real figure headed
+        // "6 INVOICES / TOTAL B" and nothing in any log.
         dmmono.set_size(SF(26.f));
+        char amt_label_buf[48];
+        const char *amt_label = amount_label_for(kind, count, amt_label_buf, sizeof(amt_label_buf));
         int total_label_y = divider_y + SPX(24);
-        dmmono.draw(canvas, "TOTAL PAYABLE", LEFT, total_label_y, theme.amt_label, SF(3.5f));
-        PROF_LAP("TOTAL PAYABLE");
+        dmmono.draw(canvas, fit_or_truncate_tracked(dmmono, amt_label, RIGHT - LEFT, SF(3.5f)).c_str(),
+                    LEFT, total_label_y, theme.amt_label, SF(3.5f));
+        PROF_LAP("amount label");
 
         // ── 9. rupee symbol + amount — dynamic sizing (grow, then shrink to fit)
         const float AMOUNT_SZ_MAX = SF(160.f);
@@ -644,6 +741,28 @@ static void bound_inputs(std::string &name, std::string &amount, std::string &da
     sanitize_field(name, 128);
     sanitize_field(amount, 20);
     sanitize_field(date, 24);
+}
+
+// The booklet page count, or 0 for "do not say".
+//
+// Digits only, and bounded at four of them before anything is parsed: this is
+// query-string input, `atoi` on a hostile string is unbounded work for us and
+// free for the caller, and a booklet of more than 9999 invoices is not a
+// booklet. Anything else — empty, signed, spaced, alphabetic, absurd — returns
+// 0, and amount_label_for then drops the count from the label rather than
+// printing a guess beside a real figure.
+static int parse_count(const std::string &raw)
+{
+    if (raw.empty() || raw.size() > 4)
+        return 0;
+    int n = 0;
+    for (unsigned char c : raw)
+    {
+        if (c < '0' || c > '9')
+            return 0;
+        n = n * 10 + (c - '0');
+    }
+    return n;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -759,7 +878,8 @@ static std::string fcgi_extract_qs(const uint8_t *p, int len)
 
 static void parse_qs(const std::string &qs,
                      std::string &name, std::string &amount,
-                     std::string &date, std::string &theme_id)
+                     std::string &date, std::string &theme_id,
+                     std::string &kind_id, std::string &count)
 {
     size_t pos = 0;
     while (pos < qs.size())
@@ -781,6 +901,10 @@ static void parse_qs(const std::string &qs,
                 date = v;
             else if (k == "theme")
                 theme_id = v;
+            else if (k == "kind")
+                kind_id = v;
+            else if (k == "count")
+                count = v;
         }
         pos = amp + 1;
     }
@@ -788,7 +912,7 @@ static void parse_qs(const std::string &qs,
 
 static void handle_client_fcgi(int cli, Renderer &renderer)
 {
-    std::string name, amount, date, theme_id;
+    std::string name, amount, date, theme_id, kind_id, count_raw, post_body;
     uint16_t req_id = 1;
 
     while (true)
@@ -808,14 +932,58 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
         {
             std::string qs = fcgi_extract_qs(body.data(), clen);
             if (!qs.empty())
-                parse_qs(qs, name, amount, date, theme_id);
+                parse_qs(qs, name, amount, date, theme_id, kind_id, count_raw);
+        }
+        else if (hdr.type == FCGI_STDIN && clen > 0)
+        {
+            // A POSTed body, so a caller with a long name or an awkward
+            // character is not forced to fit it into a URL somebody may log,
+            // truncate or re-encode. Same keys, same closed vocabulary, same
+            // percent-encoding: application/x-www-form-urlencoded, which
+            // parse_qs already reads exactly. There is deliberately no JSON
+            // parser here — this daemon renders untrusted input on a public
+            // URL, and a hand-rolled parser is the last thing it needs.
+            //
+            // Bounded, and the excess is DROPPED rather than the connection:
+            // the record loop must keep reading to the stream terminator or
+            // the FastCGI conversation desyncs and nginx reports a 502 with no
+            // explanation. What fits is 8 KB, which is two orders of magnitude
+            // above the ~200 bytes six bounded fields can occupy.
+            static constexpr size_t MAX_BODY = 8192;
+            if (post_body.size() < MAX_BODY)
+                post_body.append((const char *)body.data(),
+                                 std::min<size_t>(clen, MAX_BODY - post_body.size()));
         }
         else if (hdr.type == FCGI_STDIN && clen == 0)
             break; // end of request
     }
 
+    // The body is parsed AFTER the query string, so a key given in both is
+    // taken from the body: it is the more deliberate half of the request, and
+    // a caller who posts a name has said what they meant more clearly than a
+    // URL that may have been assembled by something else.
+    if (!post_body.empty())
+        parse_qs(post_body, name, amount, date, theme_id, kind_id, count_raw);
+
     if (name.empty())
+    {
+        // A REAL 400, not silence.
+        //
+        // This used to `return`, which drops the connection mid-conversation:
+        // nginx turns that into a 502 with nothing in either log, and a
+        // scraper renders it as a broken image. Now that the endpoint is
+        // public and universal (taxifo.com/preview.png) the caller is not
+        // always trunk, and "you gave me no company" is worth saying out loud.
+        static const char kNoName[] =
+            "Status: 400 Bad Request\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            "company is required\n";
+        fcgi_write_record(cli, FCGI_STDOUT, req_id, (const uint8_t *)kNoName, sizeof(kNoName) - 1);
+        fcgi_write_record(cli, FCGI_STDOUT, req_id, nullptr, 0);
+        uint8_t end400[8] = {};
+        fcgi_write_record(cli, FCGI_END_REQUEST, req_id, end400, 8);
         return;
+    }
     bound_inputs(name, amount, date);
 
     const Theme &theme = theme_id.empty()
@@ -826,7 +994,8 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
     // No per-request logging: this is a hot path serving untrusted input, a log
     // line per card is wasted I/O (and, in a long-lived process, would sit in a
     // never-flushed stdout buffer). Only startup and errors are logged.
-    auto png = renderer.render(name, amount, date, theme);
+    auto png = renderer.render(name, amount, date, theme,
+                               kind_by_id(kind_id.c_str()), parse_count(count_raw));
 
     // STDOUT: headers + body (chunk if > 65535)
     char hdrs[256];
@@ -896,7 +1065,7 @@ static void handle_client_http(int cli, Renderer &renderer)
     }
 
     std::string qs(q + 1, sp);
-    std::string name, amount, date, theme_id;
+    std::string name, amount, date, theme_id, kind_id, count_raw;
 
     size_t pos = 0;
     while (pos < qs.size())
@@ -918,6 +1087,10 @@ static void handle_client_http(int cli, Renderer &renderer)
                 date = v;
             else if (k == "theme")
                 theme_id = v;
+            else if (k == "kind")
+                kind_id = v;
+            else if (k == "count")
+                count_raw = v;
         }
         pos = amp + 1;
     }
@@ -935,7 +1108,8 @@ static void handle_client_http(int cli, Renderer &renderer)
                              : theme_by_id(theme_id.c_str());
 
     date = format_date_display(date);
-    auto png = renderer.render(name, amount, date, theme);
+    auto png = renderer.render(name, amount, date, theme,
+                               kind_by_id(kind_id.c_str()), parse_count(count_raw));
 
     char hdr[256];
     int hl = snprintf(hdr, sizeof(hdr),
@@ -955,28 +1129,34 @@ static void handle_client_tab(int cli, Renderer &renderer)
     char buf[512] = {};
     read(cli, buf, sizeof(buf) - 1);
     std::string req(buf);
-    auto t1 = req.find('\t');
-    auto t2 = req.find('\t', t1 + 1);
-    if (t1 == std::string::npos || t2 == std::string::npos)
-        return;
+    if (!req.empty() && req.back() == '\n')
+        req.pop_back();
 
-    std::string name = req.substr(0, t1);
-    std::string amount = req.substr(t1 + 1, t2 - t1 - 1);
-    std::string date, theme_id;
-    auto t3 = req.find('\t', t2 + 1);
-    if (t3 == std::string::npos)
+    // Positional, tab-separated, trailing fields optional:
+    //   name \t amount \t date [\t theme [\t kind [\t count]]]
+    //
+    // Split once rather than chained find()s: the old hand-unrolled version
+    // handled exactly three and four fields, and every field added past that
+    // was another nested branch. name and amount are required; everything
+    // after date is a refinement the caller may omit.
+    std::vector<std::string> f;
+    for (size_t pos = 0;;)
     {
-        date = req.substr(t2 + 1);
-        if (!date.empty() && date.back() == '\n')
-            date.pop_back();
+        size_t t = req.find('\t', pos);
+        if (t == std::string::npos)
+        {
+            f.push_back(req.substr(pos));
+            break;
+        }
+        f.push_back(req.substr(pos, t - pos));
+        pos = t + 1;
     }
-    else
-    {
-        date = req.substr(t2 + 1, t3 - t2 - 1);
-        theme_id = req.substr(t3 + 1);
-        if (!theme_id.empty() && theme_id.back() == '\n')
-            theme_id.pop_back();
-    }
+    if (f.size() < 3)
+        return;
+    auto field = [&f](size_t i) -> std::string { return i < f.size() ? f[i] : std::string(); };
+
+    std::string name = f[0], amount = f[1], date = f[2];
+    std::string theme_id = field(3), kind_id = field(4), count_raw = field(5);
 
     bound_inputs(name, amount, date);
     const Theme &theme = theme_id.empty()
@@ -984,7 +1164,8 @@ static void handle_client_tab(int cli, Renderer &renderer)
                              : theme_by_id(theme_id.c_str());
 
     date = format_date_display(date);
-    auto png = renderer.render(name, amount, date, theme);
+    auto png = renderer.render(name, amount, date, theme,
+                               kind_by_id(kind_id.c_str()), parse_count(count_raw));
     uint32_t sz = (uint32_t)png.size();
     uint32_t render_us = 0;
     write(cli, &sz, 4);
@@ -1097,18 +1278,26 @@ static void prewarm(Renderer &r)
     struct Sample
     {
         const char *name, *amount, *date;
+        CardKind kind;
+        int count;
     };
+    // Both kinds, because their labels do not share glyphs: a booklet's
+    // "INVOICES / TOTAL BILLED" has no overlap with "TOTAL PAYABLE" beyond
+    // T, O, A and L, and a cold booklet render would pay to rasterise the
+    // rest on the first customer who opens one.
     static const Sample samples[] = {
-        {"Acme Industries Private Limited", "1234567", "2026-09-01"},
-        {"Zeta Traders LLP", "999", "2026-01-15"},
-        {"A", "50000000", "2026-12-31"},
+        {"Acme Industries Private Limited", "1234567", "2026-09-01", CardKind::Invoice, 0},
+        {"Zeta Traders LLP", "999", "2026-01-15", CardKind::Invoice, 0},
+        {"A", "50000000", "2026-12-31", CardKind::Invoice, 0},
+        {"Acme Industries Private Limited", "708000", "", CardKind::Booklet, 6},
+        {"Deshpande & Iyer Associates", "708000", "", CardKind::BookletMixed, 12},
     };
     for (const auto &s : samples)
     {
         std::string nm = s.name, amt = s.amount;
         std::string dt = format_date_display(s.date);
         const Theme &t = theme_for_amount(parse_amount_to_paise(amt.c_str()));
-        (void)r.render(nm, amt, dt, t);
+        (void)r.render(nm, amt, dt, t, s.kind, s.count);
     }
 }
 
