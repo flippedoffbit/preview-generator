@@ -66,7 +66,26 @@ struct Canvas
     std::vector<uint8_t> px;
     int w, h;
 
+    // The vertical extent of everything drawn since the last fill().
+    //
+    // Tracked per DRAW CALL rather than per pixel — two comparisons for a whole
+    // glyph — so centre_vertically() below costs nothing measurable. Scanning
+    // the finished bitmap for ink would be 756k pixel comparisons on a 2.5 ms
+    // render, which is a fifth of the budget to learn something the drawing
+    // code already knew.
+    int ink_top = INT32_MAX;
+    int ink_bottom = INT32_MIN;
+
     Canvas(int w, int h) : px(w * h * CH), w(w), h(h) {}
+
+    void note_ink(int y0, int y1)
+    {
+        if (y0 < 0) y0 = 0;
+        if (y1 > h - 1) y1 = h - 1;
+        if (y0 > y1) return;
+        if (y0 < ink_top) ink_top = y0;
+        if (y1 > ink_bottom) ink_bottom = y1;
+    }
 
     // fill entire canvas with one colour
     void fill(RGBA c)
@@ -78,11 +97,79 @@ struct Canvas
             px[i * CH + 2] = c.b;
             px[i * CH + 3] = c.a;
         }
+        ink_top = INT32_MAX;
+        ink_bottom = INT32_MIN;
+    }
+
+    // Slide everything drawn so the space above it equals the space below.
+    //
+    // MEASURED, NOT TUNED, and that is the point. The three layouts this
+    // renderer produces had top/bottom margins of 83/17, 77/16 and 83/148
+    // against side margins of 80 — the invoice card had been bottom-starved
+    // since it was written, its total's descenders 16px off the edge, and the
+    // booklet card with no contents rows was bottom-heavy by the same amount
+    // again in the other direction. Each could have been fixed by moving
+    // constants until it looked right, three times, and broken again by the
+    // next layout change.
+    //
+    // Instead the composition stays anchored at the top-left where it is
+    // written, and the finished block is centred as a whole. A new row, a
+    // longer name that wraps to a smaller size, a kind that draws one line
+    // fewer: all of them stay balanced without anybody re-measuring.
+    //
+    // The shift is a row-wise move within one buffer and the vacated band is
+    // refilled with the background, so nothing from the previous position
+    // survives.
+    void centre_vertically(RGBA bg)
+    {
+        if (ink_bottom < ink_top)
+            return; // nothing was drawn
+        int block = ink_bottom - ink_top + 1;
+        if (block >= h)
+            return; // taller than the canvas; leave it where it is
+        int shift = (h - block) / 2 - ink_top;
+        if (shift == 0)
+            return;
+
+        const size_t stride = (size_t)w * CH;
+        if (shift > 0)
+            for (int y = h - 1; y >= 0; --y)
+            {
+                int src = y - shift;
+                std::memcpy(px.data() + (size_t)y * stride,
+                            src >= 0 && src < h ? px.data() + (size_t)src * stride : px.data(),
+                            stride);
+            }
+        else
+            for (int y = 0; y < h; ++y)
+            {
+                int src = y - shift;
+                std::memcpy(px.data() + (size_t)y * stride,
+                            src >= 0 && src < h ? px.data() + (size_t)src * stride : px.data(),
+                            stride);
+            }
+
+        // Repaint the band the content vacated. Copying a row from outside the
+        // canvas above would otherwise duplicate whatever row 0 happened to
+        // hold, which is a stripe of the old layout across the new margin.
+        int blank_from = shift > 0 ? 0 : h + shift;
+        int blank_to = shift > 0 ? shift : h;
+        for (int y = blank_from; y < blank_to && y < h; ++y)
+            if (y >= 0)
+                for (int x = 0; x < w; ++x)
+                {
+                    uint8_t *p = px.data() + ((size_t)y * w + x) * CH;
+                    p[0] = bg.r; p[1] = bg.g; p[2] = bg.b; p[3] = bg.a;
+                }
+
+        ink_top += shift;
+        ink_bottom += shift;
     }
 
     // filled rectangle — no blending, solid
     void rect(int x, int y, int rw, int rh, RGBA c)
     {
+        note_ink(y, y + rh - 1);
         for (int row = y; row < y + rh; ++row)
         {
             if (row < 0 || row >= h)
@@ -104,6 +191,7 @@ struct Canvas
     void blit_glyph(const uint8_t *bmp, int bw, int bh,
                     int dx, int dy, RGBA c)
     {
+        note_ink(dy, dy + bh - 1);
         for (int row = 0; row < bh; ++row)
         {
             for (int col = 0; col < bw; ++col)
@@ -848,7 +936,16 @@ struct Renderer
         dmmono.draw(canvas, date.c_str(), RIGHT - date_w, date_y, theme.date);
         PROF_LAP("date");
 
-        // ── 11. encode PNG ─────────────────────────────────────────────────────
+        // ── 11. balance the whole block, then encode ──────────────────────────
+        //
+        // Everything above composes downwards from a fixed top margin, which is
+        // the readable way to write a layout and the wrong way to sit in a
+        // frame: what ends up at the bottom is whatever is left over. Centring
+        // here costs one row-wise move and makes every kind -- invoice,
+        // booklet, booklet with no rows -- balanced by construction.
+        canvas.centre_vertically(theme.bg);
+        PROF_LAP("centre");
+
         std::vector<uint8_t> out;
         // A flat-colour card of this size PNG-compresses to well under this;
         // reserving up front spares fpng its incremental regrowth.
