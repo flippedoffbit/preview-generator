@@ -758,8 +758,13 @@ struct Renderer
             // than an obviously partial one.
             if (c.more > 0)
             {
+                // "+2 MORE", with no space after the plus. DM Mono is
+                // monospaced and this label is tracked out like every other
+                // one, so a space here costs a full cell PLUS the tracking --
+                // a visible hole between the sign and the number it belongs
+                // to, which reads as two separate things rather than one.
                 char more_buf[32];
-                snprintf(more_buf, sizeof(more_buf), "+ %d MORE", c.more);
+                snprintf(more_buf, sizeof(more_buf), "+%d MORE", c.more);
                 dmmono.set_size(SF(24.f));
                 dmmono.draw(canvas, more_buf, LEFT, row_y - SPX(6), theme.sub_label, SF(3.f));
                 row_y += SPX(30);
