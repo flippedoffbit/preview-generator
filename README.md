@@ -43,20 +43,40 @@ the labels — never the other way round: this renders untrusted text on a publi
 unauthenticated URL, and caller-supplied labels would make it a general
 text-over-image service anybody could point at anything.
 
-| `kind=` | above the name | above the figure |
-|---|---|---|
-| *(absent)*, `invoice` | `BILLED TO` | `TOTAL PAYABLE` |
-| `booklet` | `BILLED TO` | `6 INVOICES / TOTAL BILLED` |
-| `booklet-mixed` | `FROM` | `6 INVOICES / TOTAL BILLED` |
+| `kind=` | layout | above the name | above the figure |
+|---|---|---|---|
+| *(absent)*, `invoice` | one document | `BILLED TO` | `TOTAL PAYABLE` |
+| `booklet` | contents list | `5 INVOICES BILLED TO` | `TOTAL BILLED` |
+| `booklet-mixed` | contents list | `5 INVOICES FROM` | `TOTAL BILLED` |
 
-`count` supplies the number and is digits-only, 1–9999; anything else drops the
-count from the label rather than printing a guess beside a real figure. An
-unknown `kind` falls back to `invoice`, for the reason `theme_by_id` falls back
-to `THEMES[0]` — a wrong-looking card beats a broken image.
+An unknown `kind` falls back to `invoice`, for the reason `theme_by_id` falls
+back to `THEMES[0]` — a wrong-looking card beats a broken image.
 
 `booklet-mixed` exists because a set of invoices may span several
 counterparties, and there the name is the ISSUER: heading that card "BILLED TO"
 would name the sender as the debtor.
+
+**The contents list** is what makes a booklet card tell the whole story rather
+than flattening a set to one name and one total. Up to three rows arrive as
+`r1`–`r3` (label) and `a1`–`a3` (amount), with `more` carrying how many did not
+fit; the daemon draws each row with leader dots joining the two, the way the
+booklet's own HTML page does, and "+ N MORE" beneath.
+
+Rules worth knowing before sending them:
+
+- **Both halves or the row is dropped.** An amount against the right margin
+  attributable to nothing is worse than one row fewer.
+- **Rows arrive chosen and ordered.** trunk sends the three LARGEST by value,
+  descending, so the elided rows are always smaller than the shown ones and
+  "+ 24 MORE" cannot be hiding the biggest invoice in the set.
+- **The label is the caller's to pick**, like `company`: trunk sends the bill
+  number when every invoice shares one party (that name is already the
+  headline) and the party name when they do not.
+- **`count` is drawn at headline size**, twice the label beside it, sharing a
+  baseline. The count is the one fact separating this card from the invoice
+  card, and the first version of it had the count as the smallest text present.
+- Rows are ignored on an `invoice` kind — that would be a card about a set of
+  one. `count` is digits only, 1–9999.
 
 **Protocol & Usage**
 
