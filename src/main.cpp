@@ -337,10 +337,52 @@ static CardKind kind_by_id(const char *id)
 // the set spans two counterparties, which the booklet schema permits; there the
 // name is the issuing firm and the label has to say so, or the card states
 // something false about who owes what.
-static const char *name_label_for(CardKind k)
+//
+// On a booklet the count joins it, because the count IS the subject: "4
+// INVOICES BILLED TO / Erode Handloom Weavers" reads as one sentence. The
+// renderer draws the numeral itself at twice this label's size — see step 4,
+// which composes the two runs on a shared baseline.
+static const char *name_label_tail(CardKind k)
 {
     return k == CardKind::BookletMixed ? "FROM" : "BILLED TO";
 }
+
+// One line of the contents list: what it is, and what it came to.
+//
+// The card is a miniature of the page it links to, which is deliberately built
+// as a cover and a TABLE OF CONTENTS with leader dots running to each amount.
+// A booklet card that named one party and one total was not the whole story --
+// a booklet may span several counterparties, and the reader deciding whether to
+// open it deserves to see which.
+//
+// `label` is the page's own rule applied to a smaller space: the BILL NUMBER
+// when every invoice is billed to the same party (repeating that party down
+// three rows spends the widest column on a word the reader already knows), and
+// the PARTY NAME when they are not. trunk decides which; the daemon just draws
+// what it is handed, the same way it draws `company`.
+struct ContentsRow
+{
+    std::string label;
+    std::string amount;
+};
+static constexpr int MAX_CONTENTS_ROWS = 3;
+
+// Everything one card render needs.
+//
+// A struct rather than another positional argument: render() was already at six
+// and this adds seven more, at which point every call site is a row of values
+// whose meaning is their order.
+struct CardData
+{
+    std::string name;
+    std::string amount;
+    std::string date;
+    CardKind kind = CardKind::Invoice;
+    int count = 0; // invoices in the set
+    int more = 0;  // rows the card could not show
+    ContentsRow rows[MAX_CONTENTS_ROWS];
+    int row_count = 0;
+};
 
 // The label above the figure.
 //
@@ -353,16 +395,11 @@ static const char *name_label_for(CardKind k)
 // correctly in six months, and the settled and due figures are deliberately
 // not renderable here at all.
 //
-// Written into `buf` because the booklet form carries the page count. The count
-// is dropped rather than guessed when it is absent or implausible.
-static const char *amount_label_for(CardKind k, int count, char *buf, size_t buflen)
+// The count now rides on the NAME label (see name_label_for), where it is a
+// headline rather than small print, so this is just the two words.
+static const char *amount_label_for(CardKind k)
 {
-    if (k == CardKind::Invoice)
-        return "TOTAL PAYABLE";
-    if (count <= 0)
-        return "TOTAL BILLED";
-    snprintf(buf, buflen, "%d %s / TOTAL BILLED", count, count == 1 ? "INVOICE" : "INVOICES");
-    return buf;
+    return k == CardKind::Invoice ? "TOTAL PAYABLE" : "TOTAL BILLED";
 }
 
 // Truncate text to fit max_w pixels, appending "…" if needed.
@@ -542,13 +579,56 @@ struct Renderer
         return true;
     }
 
-    std::vector<uint8_t> render(const std::string &name,
-                                const std::string &amount,
-                                const std::string &date,
-                                const Theme &theme,
-                                CardKind kind = CardKind::Invoice,
-                                int count = 0)
+    // Draw one contents row: label on the left, amount on the right, leader
+    // dots joining them.
+    //
+    // The dots are not decoration. Across a 1200px card the eye loses which
+    // amount belongs to which name, which is the whole reason a printed
+    // contents page has had them for centuries; the booklet's own HTML page
+    // uses them for the same reason and this card is its miniature.
+    //
+    // Returns the y of the next row.
+    int draw_contents_row(Canvas &canvas, const ContentsRow &row, int y,
+                          int left, int right, const Theme &theme)
     {
+        const int GAP = SPX(14); // clear space either side of the dots
+        dmmono.set_size(SF(34.f));
+
+        // The amount is drawn first and never truncated: a row whose figure is
+        // cut off is worse than a row whose name is, because a shortened name
+        // is obviously shortened and a shortened number is just a wrong number.
+        int amount_w = dmmono.measure(row.amount.c_str());
+        dmmono.draw(canvas, row.amount.c_str(), right - amount_w, y, theme.amount);
+
+        // The label gets whatever is left, less room for at least a few dots.
+        int label_max = right - amount_w - left - GAP * 2 - SPX(40);
+        std::string label = fit_or_truncate(dmmono, row.label, label_max);
+        int label_end = dmmono.draw(canvas, label.c_str(), left, y, theme.name);
+
+        // Leader dots, one glyph at a time so the run ends on a whole dot
+        // rather than a clipped half.
+        int dot_w = dmmono.measure("·");
+        if (dot_w > 0)
+        {
+            int baseline_y = y;
+            for (int x = label_end + GAP; x + dot_w <= right - amount_w - GAP; x += dot_w)
+                dmmono.draw(canvas, "·", x, baseline_y, theme.divider);
+        }
+        return y + SPX(44);
+    }
+
+    std::vector<uint8_t> render(const CardData &c, const Theme &theme)
+    {
+        const std::string &name = c.name;
+        const std::string &amount = c.amount;
+        const std::string &date = c.date;
+        const CardKind kind = c.kind;
+
+        // A contents list changes the whole vertical budget: the name and the
+        // figure both give up size so three rows and their labels fit between
+        // them. Without rows the card keeps the layout it has always had.
+        const bool has_rows = c.row_count > 0;
+
 // #if PROFILE
 // #define PROF_LAP(label)                                                             \
 //     do                                                                              \
@@ -581,16 +661,54 @@ struct Renderer
         // ── 3. split name into base + optional business suffix ────────────────
         auto [base_name, suffix] = split_business_suffix(name);
 
-        // ── 4. sub-label: "BILLED TO" / "FROM" (larger for legibility)
-        dmmono.set_size(SF(28.f));
+        // ── 4. sub-label: "4 INVOICES BILLED TO" / "BILLED TO" / "FROM"
+        //
+        // THE NUMERAL IS DRAWN AT TWICE THE LABEL SIZE, and that is the point of
+        // this line. The first booklet card put the count inside the small
+        // tracked label over the figure, where "4 INVOICES" was the smallest
+        // text on a card whose entire subject is that it is a SET -- the one
+        // fact distinguishing it from the invoice card it otherwise resembles.
+        //
+        // The two runs share a BASELINE rather than a top edge: Font::draw takes
+        // the top and derives the baseline from that face's ascent, so aligning
+        // the tops of two sizes leaves the larger run sitting visibly low.
         y = SPX(72);
-        dmmono.draw(canvas, name_label_for(kind), LEFT, y, theme.sub_label, SF(3.5f));
+        int label_x = LEFT;
+        int name_top = SPX(120);
+        const char *label_tail = name_label_tail(kind);
+        if (kind != CardKind::Invoice && c.count > 0)
+        {
+            char num[8];
+            snprintf(num, sizeof(num), "%d", c.count);
+            dmmono.set_size(SF(52.f));
+            int big_baseline = y + (int)(dmmono.ascent * dmmono.scale);
+            label_x = dmmono.draw(canvas, num, LEFT, y, theme.name, SF(1.f)) + SPX(12);
+
+            dmmono.set_size(SF(28.f));
+            int small_y = big_baseline - (int)(dmmono.ascent * dmmono.scale);
+            char words[48];
+            snprintf(words, sizeof(words), "%s %s", c.count == 1 ? "INVOICE" : "INVOICES", label_tail);
+            dmmono.draw(canvas,
+                        fit_or_truncate_tracked(dmmono, words, RIGHT - label_x, SF(3.5f)).c_str(),
+                        label_x, small_y, theme.sub_label, SF(3.5f));
+            // The numeral is taller than the label it replaces, so the name
+            // below has to move down by the difference or it collides with the
+            // descenders.
+            name_top += SPX(20);
+        }
+        else
+        {
+            dmmono.set_size(SF(28.f));
+            dmmono.draw(canvas,
+                        fit_or_truncate_tracked(dmmono, label_tail, RIGHT - LEFT, SF(3.5f)).c_str(),
+                        LEFT, y, theme.sub_label, SF(3.5f));
+        }
         PROF_LAP("name label");
 
         // ── 5. name (Fraunces Bold, auto-fitted) — allow larger max size
         const int NAME_MAX_W = RIGHT - LEFT;
-        const float NAME_SZ_MAX = SF(110.f);
-        const float NAME_SZ_MIN = SF(48.f);
+        const float NAME_SZ_MAX = has_rows ? SF(76.f) : SF(110.f);
+        const float NAME_SZ_MIN = has_rows ? SF(40.f) : SF(48.f);
         const float NAME_SZ_STEP = SF(4.f);
 
         float name_sz = NAME_SZ_MAX;
@@ -602,7 +720,7 @@ struct Renderer
         }
         std::string display_name = fit_or_truncate(fraunces, base_name, NAME_MAX_W);
 
-        y = SPX(120);
+        y = name_top;
         fraunces.draw(canvas, display_name.c_str(), LEFT, y, theme.name);
         PROF_LAP("name draw");
 
@@ -624,28 +742,47 @@ struct Renderer
         }
 
         // ── 7. divider line (moved up to reduce empty space)
-        int divider_y = name_bottom + SPX(36);
+        int divider_y = name_bottom + SPX(has_rows ? 26 : 36);
         canvas.rect(LEFT, divider_y, RIGHT - LEFT, std::max(1, SPX(1)), theme.divider);
 
-        // ── 8. "TOTAL PAYABLE" / "6 INVOICES / TOTAL BILLED" label (larger)
+        // ── 7b. the contents list, and what it could not fit
+        if (has_rows)
+        {
+            int row_y = divider_y + SPX(26);
+            for (int i = 0; i < c.row_count && i < MAX_CONTENTS_ROWS; ++i)
+                row_y = draw_contents_row(canvas, c.rows[i], row_y, LEFT, RIGHT, theme);
+
+            // "+ 2 MORE" is not a nicety. Three rows over a booklet of ten,
+            // with no overflow line, is a card that states a complete contents
+            // list and is missing seven of them -- a quiet lie, which is worse
+            // than an obviously partial one.
+            if (c.more > 0)
+            {
+                char more_buf[32];
+                snprintf(more_buf, sizeof(more_buf), "+ %d MORE", c.more);
+                dmmono.set_size(SF(24.f));
+                dmmono.draw(canvas, more_buf, LEFT, row_y - SPX(6), theme.sub_label, SF(3.f));
+                row_y += SPX(30);
+            }
+            divider_y = row_y + SPX(6);
+            canvas.rect(LEFT, divider_y, RIGHT - LEFT, std::max(1, SPX(1)), theme.divider);
+            PROF_LAP("contents rows");
+        }
+
+        // ── 8. "TOTAL PAYABLE" / "TOTAL BILLED" label (larger)
         //
-        // Fitted rather than clipped. The longest label this can produce today
-        // is "9999 INVOICES / TOTAL BILLED" and it fits with room to spare, so
-        // the fit never fires — it is here because the label is the string most
-        // likely to grow (a new kind, a longer word), and the failure it
-        // prevents is silent: Canvas::blit_glyph clips glyph-by-glyph without
-        // complaint, so an overlong label would leave a real figure headed
-        // "6 INVOICES / TOTAL B" and nothing in any log.
+        // Fitted rather than clipped: Canvas::blit_glyph clips glyph-by-glyph
+        // without complaint, so an overlong label would leave a real figure
+        // headed "TOTAL B" and nothing in any log.
         dmmono.set_size(SF(26.f));
-        char amt_label_buf[48];
-        const char *amt_label = amount_label_for(kind, count, amt_label_buf, sizeof(amt_label_buf));
-        int total_label_y = divider_y + SPX(24);
-        dmmono.draw(canvas, fit_or_truncate_tracked(dmmono, amt_label, RIGHT - LEFT, SF(3.5f)).c_str(),
+        int total_label_y = divider_y + SPX(has_rows ? 18 : 24);
+        dmmono.draw(canvas,
+                    fit_or_truncate_tracked(dmmono, amount_label_for(kind), RIGHT - LEFT, SF(3.5f)).c_str(),
                     LEFT, total_label_y, theme.amt_label, SF(3.5f));
         PROF_LAP("amount label");
 
         // ── 9. rupee symbol + amount — dynamic sizing (grow, then shrink to fit)
-        const float AMOUNT_SZ_MAX = SF(160.f);
+        const float AMOUNT_SZ_MAX = has_rows ? SF(96.f) : SF(160.f);
         const float AMOUNT_SZ_MIN = SF(36.f);
         const float AMOUNT_SZ_STEP = SF(4.f);
         const float RUPEE_RATIO = 0.7f; // rupee glyph ~70% of amount digit size — a ratio, unscaled
@@ -665,7 +802,7 @@ struct Renderer
             amt_sz -= AMOUNT_SZ_STEP;
         }
 
-        int amount_y = total_label_y + SPX(36);
+        int amount_y = total_label_y + SPX(has_rows ? 30 : 36);
         int amount_baseline = amount_y + (int)(dmmono.ascent * dmmono.scale);
         int rupee_top = amount_baseline - (int)(inter.ascent * inter.scale);
         int rupee_end = inter.draw(canvas, "₹", LEFT, rupee_top, theme.rupee);
@@ -765,6 +902,137 @@ static int parse_count(const std::string &raw)
     return n;
 }
 
+// The raw wire fields, before any of them are trusted.
+//
+// One struct so the three protocol backends collect the same set and hand it to
+// the same builder. They used to each carry their own list of local strings,
+// which is how a key added for one of them quietly did nothing in the others.
+struct CardFields
+{
+    std::string company, amount, date, theme, kind, count, more;
+    std::string row_label[MAX_CONTENTS_ROWS];
+    std::string row_amount[MAX_CONTENTS_ROWS];
+};
+
+// Bound, validate and convert the wire fields into what render() draws.
+//
+// Every cap is here rather than at the call sites, because the caps ARE the
+// defence: this is untrusted text about to reach a C++ font shaper, and a limit
+// that only one of three protocol backends applies is not a limit.
+//
+// A row is kept only when BOTH halves are present. A label with no figure is a
+// contents line that says nothing, and a figure with no label is worse -- an
+// amount floating against the right margin, attributable to nothing.
+static CardData build_card(const CardFields &f)
+{
+    CardData c;
+    c.name = f.company;
+    c.amount = f.amount;
+    c.date = f.date;
+    bound_inputs(c.name, c.amount, c.date);
+
+    c.kind = kind_by_id(f.kind.c_str());
+    c.count = parse_count(f.count);
+    c.more = parse_count(f.more);
+
+    // Contents rows are only ever drawn for a booklet. An invoice card showing
+    // "its" three contents rows would be a card about a set of one.
+    if (c.kind != CardKind::Invoice)
+    {
+        for (int i = 0; i < MAX_CONTENTS_ROWS; ++i)
+        {
+            std::string label = f.row_label[i], amount = f.row_amount[i];
+            // Shorter than the headline name: this is a row in a three-column
+            // rhythm, not the subject of the card, and the drawing code
+            // ellipsises what will not fit anyway.
+            sanitize_field(label, 64);
+            sanitize_field(amount, 20);
+            if (label.empty() || amount.empty())
+                continue;
+            c.rows[c.row_count].label = label;
+            c.rows[c.row_count].amount = amount;
+            ++c.row_count;
+        }
+    }
+    return c;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wire parsing — ONE decoder and ONE field parser for all three backends
+// ─────────────────────────────────────────────────────────────────────────────
+// These sat INSIDE the protocol #if blocks, duplicated between the FastCGI and
+// HTTP backends. Two copies of a parser is two places a key has to be added,
+// and the one nobody edits fails by silently ignoring the field -- which on a
+// card looks like a layout that simply did not happen.
+
+static std::string url_decode(const std::string &s)
+{
+    std::string r;
+    for (int i = 0; i < (int)s.size();)
+    {
+        if (s[i] == '+')
+        {
+            r += ' ';
+            ++i;
+        }
+        else if (s[i] == '%' && i + 2 < (int)s.size())
+        {
+            char h[3] = {s[i + 1], s[i + 2], 0};
+            r += (char)strtol(h, nullptr, 16);
+            i += 3;
+        }
+        else
+            r += s[i++];
+    }
+    return r;
+}
+
+// Fields arrive as key=value pairs, from QUERY_STRING or a form-encoded body.
+//
+// The contents rows are r1..r3 with their amounts in a1..a3 rather than one
+// packed "label|amount" value: an in-band separator is a character a company
+// name is allowed to contain, and the first name containing it would split into
+// two halves with no error anywhere.
+static void parse_qs(const std::string &qs, CardFields &f)
+{
+    size_t pos = 0;
+    while (pos < qs.size())
+    {
+        size_t amp = qs.find('&', pos);
+        if (amp == std::string::npos)
+            amp = qs.size();
+        std::string pair = qs.substr(pos, amp - pos);
+        size_t eq = pair.find('=');
+        if (eq != std::string::npos)
+        {
+            std::string k = pair.substr(0, eq);
+            std::string v = url_decode(pair.substr(eq + 1));
+            if (k == "company")
+                f.company = v;
+            else if (k == "amount")
+                f.amount = v;
+            else if (k == "date")
+                f.date = v;
+            else if (k == "theme")
+                f.theme = v;
+            else if (k == "kind")
+                f.kind = v;
+            else if (k == "count")
+                f.count = v;
+            else if (k == "more")
+                f.more = v;
+            else if (k.size() == 2 && k[1] >= '1' && k[1] <= '0' + MAX_CONTENTS_ROWS)
+            {
+                if (k[0] == 'r')
+                    f.row_label[k[1] - '1'] = v;
+                else if (k[0] == 'a')
+                    f.row_amount[k[1] - '1'] = v;
+            }
+        }
+        pos = amp + 1;
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ── Protocol backends ─────────────────────────────────────────────────────────
 // Build with:
@@ -824,28 +1092,6 @@ static void fcgi_write_record(int fd, uint8_t type, uint16_t req_id,
         write(fd, data, len);
 }
 
-static std::string url_decode(const std::string &s)
-{
-    std::string r;
-    for (int i = 0; i < (int)s.size();)
-    {
-        if (s[i] == '+')
-        {
-            r += ' ';
-            ++i;
-        }
-        else if (s[i] == '%' && i + 2 < (int)s.size())
-        {
-            char h[3] = {s[i + 1], s[i + 2], 0};
-            r += (char)strtol(h, nullptr, 16);
-            i += 3;
-        }
-        else
-            r += s[i++];
-    }
-    return r;
-}
-
 static std::string fcgi_extract_qs(const uint8_t *p, int len)
 {
     int i = 0;
@@ -876,43 +1122,10 @@ static std::string fcgi_extract_qs(const uint8_t *p, int len)
     return {};
 }
 
-static void parse_qs(const std::string &qs,
-                     std::string &name, std::string &amount,
-                     std::string &date, std::string &theme_id,
-                     std::string &kind_id, std::string &count)
-{
-    size_t pos = 0;
-    while (pos < qs.size())
-    {
-        size_t amp = qs.find('&', pos);
-        if (amp == std::string::npos)
-            amp = qs.size();
-        std::string pair = qs.substr(pos, amp - pos);
-        size_t eq = pair.find('=');
-        if (eq != std::string::npos)
-        {
-            std::string k = pair.substr(0, eq);
-            std::string v = url_decode(pair.substr(eq + 1));
-            if (k == "company")
-                name = v;
-            else if (k == "amount")
-                amount = v;
-            else if (k == "date")
-                date = v;
-            else if (k == "theme")
-                theme_id = v;
-            else if (k == "kind")
-                kind_id = v;
-            else if (k == "count")
-                count = v;
-        }
-        pos = amp + 1;
-    }
-}
-
 static void handle_client_fcgi(int cli, Renderer &renderer)
 {
-    std::string name, amount, date, theme_id, kind_id, count_raw, post_body;
+    CardFields fields;
+    std::string post_body;
     uint16_t req_id = 1;
 
     while (true)
@@ -932,7 +1145,7 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
         {
             std::string qs = fcgi_extract_qs(body.data(), clen);
             if (!qs.empty())
-                parse_qs(qs, name, amount, date, theme_id, kind_id, count_raw);
+                parse_qs(qs, fields);
         }
         else if (hdr.type == FCGI_STDIN && clen > 0)
         {
@@ -963,9 +1176,9 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
     // a caller who posts a name has said what they meant more clearly than a
     // URL that may have been assembled by something else.
     if (!post_body.empty())
-        parse_qs(post_body, name, amount, date, theme_id, kind_id, count_raw);
+        parse_qs(post_body, fields);
 
-    if (name.empty())
+    if (fields.company.empty())
     {
         // A REAL 400, not silence.
         //
@@ -984,18 +1197,17 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
         fcgi_write_record(cli, FCGI_END_REQUEST, req_id, end400, 8);
         return;
     }
-    bound_inputs(name, amount, date);
 
-    const Theme &theme = theme_id.empty()
-                             ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
-                             : theme_by_id(theme_id.c_str());
+    CardData card = build_card(fields);
+    const Theme &theme = fields.theme.empty()
+                             ? theme_for_amount(parse_amount_to_paise(card.amount.c_str()))
+                             : theme_by_id(fields.theme.c_str());
 
-    date = format_date_display(date);
+    card.date = format_date_display(card.date);
     // No per-request logging: this is a hot path serving untrusted input, a log
     // line per card is wasted I/O (and, in a long-lived process, would sit in a
     // never-flushed stdout buffer). Only startup and errors are logged.
-    auto png = renderer.render(name, amount, date, theme,
-                               kind_by_id(kind_id.c_str()), parse_count(count_raw));
+    auto png = renderer.render(card, theme);
 
     // STDOUT: headers + body (chunk if > 65535)
     char hdrs[256];
@@ -1018,28 +1230,6 @@ static void handle_client_fcgi(int cli, Renderer &renderer)
 }
 
 #elif defined(PROTO_HTTP)
-
-static std::string url_decode(const std::string &s)
-{
-    std::string r;
-    for (int i = 0; i < (int)s.size();)
-    {
-        if (s[i] == '+')
-        {
-            r += ' ';
-            ++i;
-        }
-        else if (s[i] == '%' && i + 2 < (int)s.size())
-        {
-            char h[3] = {s[i + 1], s[i + 2], 0};
-            r += (char)strtol(h, nullptr, 16);
-            i += 3;
-        }
-        else
-            r += s[i++];
-    }
-    return r;
-}
 
 static void handle_client_http(int cli, Renderer &renderer)
 {
@@ -1065,51 +1255,23 @@ static void handle_client_http(int cli, Renderer &renderer)
     }
 
     std::string qs(q + 1, sp);
-    std::string name, amount, date, theme_id, kind_id, count_raw;
+    CardFields fields;
+    parse_qs(qs, fields);
 
-    size_t pos = 0;
-    while (pos < qs.size())
-    {
-        size_t amp = qs.find('&', pos);
-        if (amp == std::string::npos)
-            amp = qs.size();
-        std::string pair = qs.substr(pos, amp - pos);
-        size_t eq = pair.find('=');
-        if (eq != std::string::npos)
-        {
-            std::string k = pair.substr(0, eq);
-            std::string v = url_decode(pair.substr(eq + 1));
-            if (k == "company")
-                name = v;
-            else if (k == "amount")
-                amount = v;
-            else if (k == "date")
-                date = v;
-            else if (k == "theme")
-                theme_id = v;
-            else if (k == "kind")
-                kind_id = v;
-            else if (k == "count")
-                count_raw = v;
-        }
-        pos = amp + 1;
-    }
-
-    if (name.empty())
+    if (fields.company.empty())
     {
         const char *r400 = "HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
         write(cli, r400, strlen(r400));
         return;
     }
-    bound_inputs(name, amount, date);
 
-    const Theme &theme = theme_id.empty()
-                             ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
-                             : theme_by_id(theme_id.c_str());
+    CardData card = build_card(fields);
+    const Theme &theme = fields.theme.empty()
+                             ? theme_for_amount(parse_amount_to_paise(card.amount.c_str()))
+                             : theme_by_id(fields.theme.c_str());
 
-    date = format_date_display(date);
-    auto png = renderer.render(name, amount, date, theme,
-                               kind_by_id(kind_id.c_str()), parse_count(count_raw));
+    card.date = format_date_display(card.date);
+    auto png = renderer.render(card, theme);
 
     char hdr[256];
     int hl = snprintf(hdr, sizeof(hdr),
@@ -1155,17 +1317,26 @@ static void handle_client_tab(int cli, Renderer &renderer)
         return;
     auto field = [&f](size_t i) -> std::string { return i < f.size() ? f[i] : std::string(); };
 
-    std::string name = f[0], amount = f[1], date = f[2];
-    std::string theme_id = field(3), kind_id = field(4), count_raw = field(5);
+    CardFields fields;
+    fields.company = f[0];
+    fields.amount = f[1];
+    fields.date = f[2];
+    fields.theme = field(3);
+    fields.kind = field(4);
+    fields.count = field(5);
+    // The contents rows stop here, deliberately. They are six more positional
+    // fields on a protocol whose only remaining virtue is that it is simple,
+    // and it has no caller left: trunk's client for it was deleted with
+    // /bills/preview/{uuid}. A booklet card asked for over this protocol gets
+    // the name-and-total layout, which is what it did before rows existed.
 
-    bound_inputs(name, amount, date);
-    const Theme &theme = theme_id.empty()
-                             ? theme_for_amount(parse_amount_to_paise(amount.c_str()))
-                             : theme_by_id(theme_id.c_str());
+    CardData card = build_card(fields);
+    const Theme &theme = fields.theme.empty()
+                             ? theme_for_amount(parse_amount_to_paise(card.amount.c_str()))
+                             : theme_by_id(fields.theme.c_str());
 
-    date = format_date_display(date);
-    auto png = renderer.render(name, amount, date, theme,
-                               kind_by_id(kind_id.c_str()), parse_count(count_raw));
+    card.date = format_date_display(card.date);
+    auto png = renderer.render(card, theme);
     uint32_t sz = (uint32_t)png.size();
     uint32_t render_us = 0;
     write(cli, &sz, 4);
@@ -1280,24 +1451,40 @@ static void prewarm(Renderer &r)
         const char *name, *amount, *date;
         CardKind kind;
         int count;
+        bool rows;
     };
     // Both kinds, because their labels do not share glyphs: a booklet's
     // "INVOICES / TOTAL BILLED" has no overlap with "TOTAL PAYABLE" beyond
     // T, O, A and L, and a cold booklet render would pay to rasterise the
     // rest on the first customer who opens one.
     static const Sample samples[] = {
-        {"Acme Industries Private Limited", "1234567", "2026-09-01", CardKind::Invoice, 0},
-        {"Zeta Traders LLP", "999", "2026-01-15", CardKind::Invoice, 0},
-        {"A", "50000000", "2026-12-31", CardKind::Invoice, 0},
-        {"Acme Industries Private Limited", "708000", "", CardKind::Booklet, 6},
-        {"Deshpande & Iyer Associates", "708000", "", CardKind::BookletMixed, 12},
+        {"Acme Industries Private Limited", "1234567", "2026-09-01", CardKind::Invoice, 0, false},
+        {"Zeta Traders LLP", "999", "2026-01-15", CardKind::Invoice, 0, false},
+        {"A", "50000000", "2026-12-31", CardKind::Invoice, 0, false},
+        {"Acme Industries Private Limited", "7,08,000.00", "", CardKind::Booklet, 6, true},
+        {"Deshpande & Iyer Associates", "7,08,000.00", "", CardKind::BookletMixed, 12, true},
     };
     for (const auto &s : samples)
     {
-        std::string nm = s.name, amt = s.amount;
-        std::string dt = format_date_display(s.date);
-        const Theme &t = theme_for_amount(parse_amount_to_paise(amt.c_str()));
-        (void)r.render(nm, amt, dt, t, s.kind, s.count);
+        CardData c;
+        c.name = s.name;
+        c.amount = s.amount;
+        c.date = format_date_display(s.date);
+        c.kind = s.kind;
+        c.count = s.count;
+        if (s.rows)
+        {
+            // The contents rows are their own glyph run at their own size, so a
+            // cold booklet render would rasterise the whole row face on the
+            // first customer who opened one.
+            c.rows[0] = {"Kannan Textiles Pvt Ltd", "1,20,000.00"};
+            c.rows[1] = {"INV-1042", "84,702.17"};
+            c.rows[2] = {"Devi Traders", "64,106.51"};
+            c.row_count = 3;
+            c.more = 1;
+        }
+        const Theme &t = theme_for_amount(parse_amount_to_paise(c.amount.c_str()));
+        (void)r.render(c, t);
     }
 }
 
