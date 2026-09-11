@@ -806,32 +806,44 @@ struct Renderer
         const float NAME_SZ_MIN = has_rows ? SF(40.f) : SF(48.f);
         const float NAME_SZ_STEP = SF(4.f);
 
+        // The suffix now sits BESIDE the name, so the name must leave room for
+        // it. "Pvt Ltd" on its own line under "Anvaya Textiles" read as a
+        // second fact about the company rather than the tail of its name, and
+        // it spent a whole line -- about 40px of a 630px card -- on two words.
+        const int SUFFIX_GAP = SPX(18);
+        dmmono.set_size(SF(26.f));
+        int suffix_w = suffix.empty() ? 0 : dmmono.measure(suffix.c_str(), SF(1.5f)) + SUFFIX_GAP;
+
         float name_sz = NAME_SZ_MAX;
         fraunces.set_size(name_sz);
-        while (name_sz > NAME_SZ_MIN && fraunces.measure(base_name.c_str()) > NAME_MAX_W)
+        while (name_sz > NAME_SZ_MIN && fraunces.measure(base_name.c_str()) > NAME_MAX_W - suffix_w)
         {
             name_sz -= NAME_SZ_STEP;
             fraunces.set_size(name_sz);
         }
-        std::string display_name = fit_or_truncate(fraunces, base_name, NAME_MAX_W);
+        std::string display_name = fit_or_truncate(fraunces, base_name, NAME_MAX_W - suffix_w);
 
         y = name_top;
-        fraunces.draw(canvas, display_name.c_str(), LEFT, y, theme.name);
+        int name_end = fraunces.draw(canvas, display_name.c_str(), LEFT, y, theme.name);
         PROF_LAP("name draw");
 
         // compute bottom of name glyphs for next layout steps
         int name_baseline = y + (int)(fraunces.ascent * fraunces.scale);
         int name_bottom = name_baseline + (int)(std::abs(fraunces.descent) * fraunces.scale);
 
-        // ── 6. business suffix label (if present)
+        // ── 6. business suffix, on the name's own BASELINE
+        //
+        // Set small and muted so it reads as the legal tail of the name rather
+        // than competing with it, and aligned on the baseline rather than the
+        // top: two sizes sharing a top edge leaves the smaller one floating
+        // above the line the eye is following.
         if (!suffix.empty())
         {
             dmmono.set_size(SF(26.f));
-            int suf_y = name_bottom + SPX(8);
-            dmmono.draw(canvas, suffix.c_str(), LEFT, suf_y, theme.sub_name, SF(1.5f));
+            int suf_y = name_baseline - (int)(dmmono.ascent * dmmono.scale);
+            dmmono.draw(canvas, suffix.c_str(), name_end + SUFFIX_GAP, suf_y, theme.sub_name, SF(1.5f));
             PROF_LAP("suffix draw");
-            int suf_baseline = suf_y + (int)(dmmono.ascent * dmmono.scale);
-            int suf_bottom = suf_baseline + (int)(std::abs(dmmono.descent) * dmmono.scale);
+            int suf_bottom = name_baseline + (int)(std::abs(dmmono.descent) * dmmono.scale);
             if (suf_bottom > name_bottom)
                 name_bottom = suf_bottom;
         }
@@ -889,24 +901,39 @@ struct Renderer
             PROF_LAP("contents rows");
         }
 
-        // ── 8. "TOTAL PAYABLE" / "TOTAL BILLED" label (larger)
+        // ── 8/9. the total: label on the left, figure on the right
         //
+        // WHERE A TOTAL BELONGS IS UNDER THE FIGURES IT ADDS UP. The contents
+        // card runs a column of amounts down the right edge and then set its
+        // own total hard against the left margin, under nothing, leaving the
+        // whole right half of the card empty below the rule. Stacking the label
+        // over the figure cost a second line for two words as well.
+        //
+        // So it is one line: the label on the left where the row labels are,
+        // the figure ending exactly where the row figures end. The eye runs
+        // down the column and the total is waiting at the bottom of it.
+        //
+        // The card WITHOUT a contents list keeps the figure on the left, and
+        // that is not an inconsistency. There, the amount is the subject of the
+        // card rather than the sum of a column -- there is no column for it to
+        // sit under -- and at 160px it spans most of the width anyway.
+        const float RUPEE_RATIO = 0.7f; // rupee glyph ~70% of the digit size — a ratio, unscaled
+        const int AMOUNT_SPACING = SPX(8);
+        const float AMOUNT_SZ_MAX = has_rows ? SF(88.f) : SF(160.f);
+        const float AMOUNT_SZ_MIN = SF(36.f);
+        const float AMOUNT_SZ_STEP = SF(4.f);
+
+        dmmono.set_size(SF(26.f));
+        const char *amt_label = amount_label_for(kind);
         // Fitted rather than clipped: Canvas::blit_glyph clips glyph-by-glyph
         // without complaint, so an overlong label would leave a real figure
         // headed "TOTAL B" and nothing in any log.
-        dmmono.set_size(SF(26.f));
-        int total_label_y = divider_y + SPX(has_rows ? 18 : 24);
-        dmmono.draw(canvas,
-                    fit_or_truncate_tracked(dmmono, amount_label_for(kind), RIGHT - LEFT, SF(3.5f)).c_str(),
-                    LEFT, total_label_y, theme.amt_label, SF(3.5f));
-        PROF_LAP("amount label");
+        std::string amt_label_text = fit_or_truncate_tracked(dmmono, amt_label, RIGHT - LEFT, SF(3.5f));
+        int amt_label_w = dmmono.measure(amt_label_text.c_str(), SF(3.5f));
 
-        // ── 9. rupee symbol + amount — dynamic sizing (grow, then shrink to fit)
-        const float AMOUNT_SZ_MAX = has_rows ? SF(96.f) : SF(160.f);
-        const float AMOUNT_SZ_MIN = SF(36.f);
-        const float AMOUNT_SZ_STEP = SF(4.f);
-        const float RUPEE_RATIO = 0.7f; // rupee glyph ~70% of amount digit size — a ratio, unscaled
-        const int AMOUNT_SPACING = SPX(8);
+        // On the shared line the figure competes with the label for width; on
+        // its own line it has all of it.
+        const int AMOUNT_MAX_W = has_rows ? (RIGHT - LEFT - amt_label_w - SPX(40)) : (RIGHT - LEFT);
 
         float amt_sz = AMOUNT_SZ_MAX;
         int total_w = 0;
@@ -917,24 +944,60 @@ struct Renderer
             int rupee_w = inter.measure("₹");
             int digits_w = dmmono.measure(amount.c_str());
             total_w = rupee_w + AMOUNT_SPACING + digits_w;
-            if (total_w <= (RIGHT - LEFT) || amt_sz <= AMOUNT_SZ_MIN)
+            if (total_w <= AMOUNT_MAX_W || amt_sz <= AMOUNT_SZ_MIN)
                 break;
             amt_sz -= AMOUNT_SZ_STEP;
         }
 
-        int amount_y = total_label_y + SPX(has_rows ? 30 : 36);
+        int amount_y, amount_x;
+        int total_label_y;
+        if (has_rows)
+        {
+            amount_y = divider_y + SPX(22);
+            amount_x = RIGHT - total_w; // flush with the column of row figures
+            // The label rides the figure's BASELINE, not its top edge.
+            int base = amount_y + (int)(dmmono.ascent * dmmono.scale);
+            dmmono.set_size(SF(26.f));
+            total_label_y = base - (int)(dmmono.ascent * dmmono.scale);
+        }
+        else
+        {
+            total_label_y = divider_y + SPX(24);
+            amount_y = total_label_y + SPX(36);
+            amount_x = LEFT;
+        }
+        dmmono.set_size(SF(26.f));
+        int amt_label_baseline = total_label_y + (int)(dmmono.ascent * dmmono.scale);
+        dmmono.draw(canvas, amt_label_text.c_str(), LEFT, total_label_y, theme.amt_label, SF(3.5f));
+        PROF_LAP("amount label");
+
+        // ── 9b. the date, on the label's line rather than in the far corner
+        //
+        // It used to be pinned to the bottom of the CANVAS, which left about
+        // 110px of nothing between the figure and it — the single emptiest part
+        // of the card, and all of it below the only line that used the full
+        // width. Set beside "TOTAL PAYABLE" it reads as what it is (the date
+        // that figure is due), fills the right half of a line that was half
+        // empty, and lets the block close up under the amount.
+        //
+        // Only the invoice card has one: a booklet has several dates and says
+        // none of them.
+        if (!has_rows && !date.empty())
+        {
+            dmmono.set_size(SF(34.f));
+            int date_w = dmmono.measure(date.c_str());
+            int date_y = amt_label_baseline - (int)(dmmono.ascent * dmmono.scale);
+            dmmono.draw(canvas, date.c_str(), RIGHT - date_w, date_y, theme.date);
+            PROF_LAP("date");
+        }
+
+        dmmono.set_size(amt_sz);
+        inter.set_size(amt_sz * RUPEE_RATIO);
         int amount_baseline = amount_y + (int)(dmmono.ascent * dmmono.scale);
         int rupee_top = amount_baseline - (int)(inter.ascent * inter.scale);
-        int rupee_end = inter.draw(canvas, "₹", LEFT, rupee_top, theme.rupee);
+        int rupee_end = inter.draw(canvas, "₹", amount_x, rupee_top, theme.rupee);
         dmmono.draw(canvas, amount.c_str(), rupee_end + AMOUNT_SPACING, amount_y, theme.amount);
         PROF_LAP("rupee + amount");
-
-        // ── 10. date — larger, bottom-right
-        dmmono.set_size(SF(52.f));
-        int date_y = IMG_H - SPX(64);
-        int date_w = dmmono.measure(date.c_str());
-        dmmono.draw(canvas, date.c_str(), RIGHT - date_w, date_y, theme.date);
-        PROF_LAP("date");
 
         // ── 11. balance the whole block, then encode ──────────────────────────
         //
