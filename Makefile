@@ -145,8 +145,14 @@ LDFLAGS_PGO_USE  := $(LDFLAGS_REL)
 # ── release_variant macro ─────────────────────────────────────────────────────
 # $(call release_variant, suffix, zig-triple, arch-flags, proto-flag)
 # proto-flag is optional — pass empty string for legacy UDS
+# NOTE THE $(SRCS) PREREQUISITE. Without it these targets depend only on the
+# generated font headers, which change about once a year -- so after any edit to
+# main.cpp, `make out/billpreview-<variant>` printed "is up to date" and left the
+# previous binary in place. That is not a slow build, it is a DEPLOY OF THE
+# WRONG BINARY, announced in green: caught on 2026-09-11 when the card-kinds
+# build turned out to be the one from 2026-09-01, byte for byte.
 define release_variant
-$(OUT_DIR)/billpreview-$(strip $(1)): $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-$(strip $(1)): $(SRCS) $(GENERATED) | $(OUT_DIR)
 	$(ZIG) -target $(strip $(2)) \
 		$(CXXFLAGS_REL_BASE) $(strip $(3)) $(strip $(4)) \
 		-o $$@ $(SRCS) $(LDFLAGS_REL)
@@ -214,17 +220,17 @@ $(eval $(call release_variant, arm64-ampere-http,      $(ZIG_ARM64), -mcpu=amper
 $(eval $(call release_variant, arm64-ampere-fcgi,      $(ZIG_ARM64), -mcpu=ampere1,      -DPROTO_FCGI))
 
 # ── macOS arm64 — system clang, all proto variants ────────────────────────────
-$(OUT_DIR)/billpreview-mac-arm64: $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-mac-arm64: $(SRCS) $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_MAC) -o $@ $(SRCS) $(LDFLAGS_MAC)
 	@strip $@
 	@printf "  ✓ %-44s %s\n" "billpreview-mac-arm64" "$$(ls -lh $@ | awk '{print $$5}')"
 
-$(OUT_DIR)/billpreview-mac-arm64-http: $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-mac-arm64-http: $(SRCS) $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_MAC) -DPROTO_HTTP -o $@ $(SRCS) $(LDFLAGS_MAC)
 	@strip $@
 	@printf "  ✓ %-44s %s\n" "billpreview-mac-arm64-http" "$$(ls -lh $@ | awk '{print $$5}')"
 
-$(OUT_DIR)/billpreview-mac-arm64-fcgi: $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-mac-arm64-fcgi: $(SRCS) $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_MAC) -DPROTO_FCGI -o $@ $(SRCS) $(LDFLAGS_MAC)
 	@strip $@
 	@printf "  ✓ %-44s %s\n" "billpreview-mac-arm64-fcgi" "$$(ls -lh $@ | awk '{print $$5}')"
