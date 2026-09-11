@@ -378,8 +378,9 @@ struct CardData
     std::string amount;
     std::string date;
     CardKind kind = CardKind::Invoice;
-    int count = 0; // invoices in the set
-    int more = 0;  // rows the card could not show
+    int count = 0;           // invoices in the set
+    int more = 0;            // rows the card could not show
+    std::string more_amount; // what those rows come to, so the list adds up
     ContentsRow rows[MAX_CONTENTS_ROWS];
     int row_count = 0;
 };
@@ -588,22 +589,28 @@ struct Renderer
     // uses them for the same reason and this card is its miniature.
     //
     // Returns the y of the next row.
+    // `muted` draws the row in the label ink rather than the body ink. The
+    // remainder row uses it: "+2 ITEMS" is a summary of what is NOT listed, and
+    // setting it in the same weight as the three real entries would read as a
+    // fourth invoice belonging to a party called "+2 ITEMS".
     int draw_contents_row(Canvas &canvas, const ContentsRow &row, int y,
-                          int left, int right, const Theme &theme)
+                          int left, int right, const Theme &theme, bool muted = false)
     {
         const int GAP = SPX(14); // clear space either side of the dots
         dmmono.set_size(SF(34.f));
+        RGBA label_ink = muted ? theme.sub_label : theme.name;
+        RGBA amount_ink = muted ? theme.sub_name : theme.amount;
 
         // The amount is drawn first and never truncated: a row whose figure is
         // cut off is worse than a row whose name is, because a shortened name
         // is obviously shortened and a shortened number is just a wrong number.
         int amount_w = dmmono.measure(row.amount.c_str());
-        dmmono.draw(canvas, row.amount.c_str(), right - amount_w, y, theme.amount);
+        dmmono.draw(canvas, row.amount.c_str(), right - amount_w, y, amount_ink);
 
         // The label gets whatever is left, less room for at least a few dots.
         int label_max = right - amount_w - left - GAP * 2 - SPX(40);
         std::string label = fit_or_truncate(dmmono, row.label, label_max);
-        int label_end = dmmono.draw(canvas, label.c_str(), left, y, theme.name);
+        int label_end = dmmono.draw(canvas, label.c_str(), left, y, label_ink);
 
         // Leader dots, one glyph at a time so the run ends on a whole dot
         // rather than a clipped half.
@@ -752,22 +759,42 @@ struct Renderer
             for (int i = 0; i < c.row_count && i < MAX_CONTENTS_ROWS; ++i)
                 row_y = draw_contents_row(canvas, c.rows[i], row_y, LEFT, RIGHT, theme);
 
-            // "+ 2 MORE" is not a nicety. Three rows over a booklet of ten,
-            // with no overflow line, is a card that states a complete contents
-            // list and is missing seven of them -- a quiet lie, which is worse
-            // than an obviously partial one.
+            // THE REMAINDER IS A ROW, WITH ITS OWN FIGURE, and that is what
+            // makes the list add up.
+            //
+            // Three rows over a booklet of five, with no overflow line at all,
+            // is a card stating a complete contents list while missing two of
+            // them -- a quiet lie, worse than an obviously partial one. But
+            // "+2 MORE" with no figure beside it is only half a fix: the three
+            // amounts shown plainly do not sum to the total underneath them,
+            // and a reader who checks is left to wonder which number is wrong.
+            // With the remainder carrying the value of what was elided, the
+            // four figures on the card add up to the total exactly.
+            //
+            // "+2 ITEMS", not "+ 2 MORE": no space after the plus (DM Mono is
+            // monospaced, so a space costs a full cell and the sign drifts away
+            // from the number it belongs to), and "items" because they are
+            // invoices that have a value, not merely more of something.
             if (c.more > 0)
             {
-                // "+2 MORE", with no space after the plus. DM Mono is
-                // monospaced and this label is tracked out like every other
-                // one, so a space here costs a full cell PLUS the tracking --
-                // a visible hole between the sign and the number it belongs
-                // to, which reads as two separate things rather than one.
                 char more_buf[32];
-                snprintf(more_buf, sizeof(more_buf), "+%d MORE", c.more);
-                dmmono.set_size(SF(24.f));
-                dmmono.draw(canvas, more_buf, LEFT, row_y - SPX(6), theme.sub_label, SF(3.f));
-                row_y += SPX(30);
+                snprintf(more_buf, sizeof(more_buf), "+%d %s", c.more,
+                         c.more == 1 ? "ITEM" : "ITEMS");
+                if (!c.more_amount.empty())
+                {
+                    row_y = draw_contents_row(canvas, {more_buf, c.more_amount},
+                                              row_y, LEFT, RIGHT, theme, /*muted=*/true);
+                }
+                else
+                {
+                    // No remainder figure: an older trunk, which sent a count
+                    // and nothing to put beside it. Say what is known rather
+                    // than inventing the rest, and leave the row unaligned so
+                    // it cannot be mistaken for a figure that was computed.
+                    dmmono.set_size(SF(24.f));
+                    dmmono.draw(canvas, more_buf, LEFT, row_y - SPX(6), theme.sub_label, SF(3.f));
+                    row_y += SPX(30);
+                }
             }
             divider_y = row_y + SPX(6);
             canvas.rect(LEFT, divider_y, RIGHT - LEFT, std::max(1, SPX(1)), theme.divider);
@@ -914,7 +941,7 @@ static int parse_count(const std::string &raw)
 // which is how a key added for one of them quietly did nothing in the others.
 struct CardFields
 {
-    std::string company, amount, date, theme, kind, count, more;
+    std::string company, amount, date, theme, kind, count, more, more_amount;
     std::string row_label[MAX_CONTENTS_ROWS];
     std::string row_amount[MAX_CONTENTS_ROWS];
 };
@@ -939,6 +966,8 @@ static CardData build_card(const CardFields &f)
     c.kind = kind_by_id(f.kind.c_str());
     c.count = parse_count(f.count);
     c.more = parse_count(f.more);
+    c.more_amount = f.more_amount;
+    sanitize_field(c.more_amount, 20);
 
     // Contents rows are only ever drawn for a booklet. An invoice card showing
     // "its" three contents rows would be a card about a set of one.
@@ -1026,6 +1055,8 @@ static void parse_qs(const std::string &qs, CardFields &f)
                 f.count = v;
             else if (k == "more")
                 f.more = v;
+            else if (k == "morea")
+                f.more_amount = v;
             else if (k.size() == 2 && k[1] >= '1' && k[1] <= '0' + MAX_CONTENTS_ROWS)
             {
                 if (k[0] == 'r')
@@ -1487,6 +1518,7 @@ static void prewarm(Renderer &r)
             c.rows[2] = {"Devi Traders", "64,106.51"};
             c.row_count = 3;
             c.more = 1;
+            c.more_amount = "31,437.06";
         }
         const Theme &t = theme_for_amount(parse_amount_to_paise(c.amount.c_str()));
         (void)r.render(c, t);
