@@ -24,11 +24,23 @@ VENDOR_DIR := $(SRC_DIR)/vendor
 ASSET_DIR  := assets
 OUT_DIR    := out
 
+# fpng_card.cpp #includes vendor/fpng.cpp and adds the buffer-reusing encoder.
+# Compiling BOTH would be two definitions of every fpng symbol, so the vendored
+# file is deliberately absent from this list -- it is still a dependency, below.
 SRCS := $(SRC_DIR)/main.cpp \
         $(SRC_DIR)/themes.cpp \
         $(SRC_DIR)/glyph_cache.cpp \
         $(SRC_DIR)/stb_impl.cpp \
-        $(SRC_DIR)/vendor/fpng.cpp
+        $(SRC_DIR)/fpng_card.cpp
+
+# Headers and the vendored encoder body: compiled as part of the files above
+# rather than on their own, but every target must rebuild when they change. The
+# release targets learned that lesson once already -- see release_variant.
+DEPS := $(SRC_DIR)/vendor/fpng.cpp \
+        $(SRC_DIR)/card_geometry.h \
+        $(SRC_DIR)/fpng_card.h \
+        $(SRC_DIR)/themes.h \
+        $(SRC_DIR)/glyph_cache.h
 
 FONT_FRAUNCES := $(ASSET_DIR)/Fraunces-Bold.ttf
 FONT_DMMONO   := $(ASSET_DIR)/DMMono-Medium.ttf
@@ -152,7 +164,7 @@ LDFLAGS_PGO_USE  := $(LDFLAGS_REL)
 # WRONG BINARY, announced in green: caught on 2026-09-11 when the card-kinds
 # build turned out to be the one from 2026-09-01, byte for byte.
 define release_variant
-$(OUT_DIR)/billpreview-$(strip $(1)): $(SRCS) $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-$(strip $(1)): $(SRCS) $(DEPS) $(GENERATED) | $(OUT_DIR)
 	$(ZIG) -target $(strip $(2)) \
 		$(CXXFLAGS_REL_BASE) $(strip $(3)) $(strip $(4)) \
 		-o $$@ $(SRCS) $(LDFLAGS_REL)
@@ -220,17 +232,17 @@ $(eval $(call release_variant, arm64-ampere-http,      $(ZIG_ARM64), -mcpu=amper
 $(eval $(call release_variant, arm64-ampere-fcgi,      $(ZIG_ARM64), -mcpu=ampere1,      -DPROTO_FCGI))
 
 # ── macOS arm64 — system clang, all proto variants ────────────────────────────
-$(OUT_DIR)/billpreview-mac-arm64: $(SRCS) $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-mac-arm64: $(SRCS) $(DEPS) $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_MAC) -o $@ $(SRCS) $(LDFLAGS_MAC)
 	@strip $@
 	@printf "  ✓ %-44s %s\n" "billpreview-mac-arm64" "$$(ls -lh $@ | awk '{print $$5}')"
 
-$(OUT_DIR)/billpreview-mac-arm64-http: $(SRCS) $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-mac-arm64-http: $(SRCS) $(DEPS) $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_MAC) -DPROTO_HTTP -o $@ $(SRCS) $(LDFLAGS_MAC)
 	@strip $@
 	@printf "  ✓ %-44s %s\n" "billpreview-mac-arm64-http" "$$(ls -lh $@ | awk '{print $$5}')"
 
-$(OUT_DIR)/billpreview-mac-arm64-fcgi: $(SRCS) $(GENERATED) | $(OUT_DIR)
+$(OUT_DIR)/billpreview-mac-arm64-fcgi: $(SRCS) $(DEPS) $(GENERATED) | $(OUT_DIR)
 	$(CXX_NATIVE) $(CXXFLAGS_MAC) -DPROTO_FCGI -o $@ $(SRCS) $(LDFLAGS_MAC)
 	@strip $@
 	@printf "  ✓ %-44s %s\n" "billpreview-mac-arm64-fcgi" "$$(ls -lh $@ | awk '{print $$5}')"
@@ -278,7 +290,7 @@ RELEASE_FCGI := \
 RELEASE_ALL := $(RELEASE_UDS) $(RELEASE_HTTP) $(RELEASE_FCGI)
 
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: all dev mac san prof \
+.PHONY: all dev mac san prof test \
         release release-uds release-http release-fcgi \
         _release_summary clean info
 
@@ -307,6 +319,19 @@ dev: $(GENERATED) | $(OUT_DIR)
 	@echo ""
 	@echo "  ✓ dev  $(OUT_DIR)/billpreview  [$(HOST_ARCH) / $(HOST_OS)]"
 	@ls -lh $(OUT_DIR)/billpreview
+
+# ── Test ──────────────────────────────────────────────────────────────────────
+# The only automated test this repo has. It holds fpng_encode_card's output
+# byte-equal to stock fpng's on every fixture in test_out/ plus the synthetic
+# cases those do not reach. Built -O2 and WITHOUT -ffast-math or NDEBUG, so
+# fpng's own asserts are live and the encoders are not being compared under
+# flags that could change either of them.
+test: $(GENERATED) | $(OUT_DIR)
+	$(CXX_NATIVE) $(CXXSTD) $(WARNINGS) $(INCLUDES) -O2 -g \
+		-o $(OUT_DIR)/fpng_card_test tests/fpng_card_test.cpp \
+		$(SRC_DIR)/fpng_card.cpp $(SRC_DIR)/stb_impl.cpp
+	@echo ""
+	@$(OUT_DIR)/fpng_card_test test_out
 
 # ── Mac optimised ─────────────────────────────────────────────────────────────
 mac: $(GENERATED) | $(OUT_DIR)
