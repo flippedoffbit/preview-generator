@@ -1618,7 +1618,41 @@ void run_daemon(Renderer &renderer)
 
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1);
+
+    // THE PATH IS COPIED BY HAND, AND strncpy HERE WAS A REAL CRASH.
+    //
+    // zig's libc implements the strn* family by scanning the source for the
+    // terminator with 64-byte AVX-512 loads (`mem.findScalarPos`, one
+    // `vpcmpeqb (%rsi,%r8), %zmm0, %k1`), which reads up to 63 bytes PAST the
+    // NUL. Our source is an ENVIRONMENT string, and environment strings sit at
+    // the very top of the initial stack -- so whenever the path happens to end
+    // within 64 bytes of that boundary the scan crosses into unmapped memory
+    // and the daemon takes a SIGSEGV here, after `socket()` and before `bind`,
+    // having printed "[ok] renderer ready" and nothing else.
+    //
+    // Measured on the deploy host: 100% reproducible for some environments and
+    // 0% for others, the discriminator being the SIZE of the environment block
+    // (adding 4 KB of padding to it moves the string off the boundary and the
+    // crash disappears). It was present in every build back to the first, and
+    // in the binary running in production -- which survives only because its
+    // unit passes one short variable and systemd's own additions sit above it.
+    // A future Environment= line in that unit is a crash loop under
+    // Restart=always.
+    //
+    // So: our own bounded scan, which cannot read past the NUL, and a REFUSAL
+    // rather than a truncation. A silently shortened socket path is a daemon
+    // listening where nginx is not looking, which presents as the daemon being
+    // down -- exactly the class of failure this file keeps a note about.
+    size_t path_len = 0;
+    while (path_len < sizeof(addr.sun_path) && sock[path_len] != '\0')
+        ++path_len;
+    if (path_len >= sizeof(addr.sun_path))
+    {
+        fprintf(stderr, "[err] socket path is %zu bytes; the limit is %zu\n",
+                path_len, sizeof(addr.sun_path) - 1);
+        return;
+    }
+    memcpy(addr.sun_path, sock, path_len); // addr{} zeroed it, so it stays terminated
 
     if (bind(srv, (sockaddr *)&addr, sizeof(addr)) < 0)
     {

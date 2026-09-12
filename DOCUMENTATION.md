@@ -333,6 +333,34 @@ What replaced it is **prevention, in three places**:
    so no coordinate arithmetic can write outside the buffer.
 3. **Every input is bounded** before it reaches the shaper (A3).
 
+**A fourth hole, found 2026-09-13 and closed: the daemon could die before it
+ever served a request.** `run_daemon` copied the socket path out of the
+environment with `strncpy(addr.sun_path, sock, sizeof(addr.sun_path) - 1)`, and
+zig's libc implements the `strn*` family by scanning the source for the
+terminator with 64-byte vector loads (`mem.findScalarPos`, one `vpcmpeqb
+(%rsi,%r8), %zmm0, %k1`) which read up to 63 bytes PAST it. Environment strings
+live at the very top of the initial stack, so whenever the path ended within 64
+bytes of that boundary the scan crossed into unmapped memory: SIGSEGV after
+`socket()` and before `bind`, having printed `[ok] renderer ready` and nothing
+else, so the only symptom was a socket that never appeared.
+
+It was in every build ever made, including the one that was in production, and
+it survived there only because of what its unit happened to put in the
+environment — a future `Environment=` line in that unit would have been a crash
+loop under `Restart=always`. The path is now copied by a bounded loop of our
+own, and an over-long path is **refused** rather than truncated, because a
+silently shortened socket path is a daemon listening where nginx is not looking.
+`tests/socket_path_startup.py` is the guard; it has to drive `os.execve` itself,
+because the first version launched from a shell and PASSED against the broken
+binary.
+
+The general lesson is bigger than the one call site: **this binary's libc
+over-reads on every `strn*`/`strlen` it does**, and the reason that is harmless
+everywhere else is that every other string it touches lives on the heap or in
+`.bss`, surrounded by mapped pages. Anything reading a string that came from the
+environment, or that sits at the end of a mapping, needs a bounded loop rather
+than a libc call.
+
 The `try`/`catch (...)` around `handle_client` (`src/main.cpp:1639`) is the
 *backstop for allocation/size failures only*, and the comment says so: anything
 memory-unsafe is prevented upstream, not caught. A malformed request drops one
@@ -457,8 +485,20 @@ so the first scanline is left stale from the previous render (caught on every
 card); the geometry guard removed (caught — a 64×40 input produced 72,145 bytes
 against stock's 10,365); the IEND tail written one byte early (caught).
 
-**It covers the encoder and nothing else.** There is still no automated
-assertion about layout, kinds, caps or the parse. What exists for those:
+Two more gates landed 2026-09-13:
+
+- **`tests/compare_renders.sh <a> <b>`** renders 22 cards through two builds and
+  diffs the bytes — every kind, all twelve theme ids, rows and none, the overflow
+  row with and without its figure, the name lengths that drive the auto-fit, a
+  Devanagari name (boxes today, but they must be the SAME boxes) and a
+  nonsense-input case. Any change claiming to be output-neutral runs this. Its
+  first draft used invented theme ids, which fall back to `THEMES[0]`, so twelve
+  theme cases were twelve copies of one and all reported ok.
+- **`tests/socket_path_startup.py <binary>`** sweeps the environment size and
+  the path length and asserts the daemon binds every time — the guard for the
+  startup SIGSEGV in A7.
+
+**Nothing covers layout, kinds, caps or the parse.** What exists for those:
 
 - `test.sh` — starts a daemon, fires a battery of requests, writes PNGs into
   `test_out/` and reports timings. It speaks the **legacy tab protocol** and its
@@ -513,9 +553,13 @@ mostly wrong on its own; see A6. Budget for HarfBuzz or accept boxes.
 
 ## A11. Known gaps
 
-- **The only automated assertions cover the PNG encoder** (`make test`, A9).
-  Layout, card kinds, the input caps and the parse have none; for those the gate
-  is still eyeballing `test_out/` and `smoke_card` in trunk.
+- **The automated assertions cover the PNG encoder, output-neutrality and
+  startup** (`make test`, `tests/compare_renders.sh`, `tests/socket_path_startup.py`
+  — A9). Layout, card kinds, the input caps and the parse have none; for those
+  the gate is still eyeballing `test_out/` and `smoke_card` in trunk.
+- **The libc over-reads past a string's terminator** (A7). Closed at the one
+  call site where it could fault; the hazard is structural and lives in zig's
+  `mem.findScalarPos`.
 - **Latin only** (A6), recorded rather than unnoticed.
 - **Single-threaded**; one slow render is a queue.
 - **No `Cache-Control`/`ETag`** on the FastCGI response.
