@@ -1560,7 +1560,11 @@ static void handle_client(int cli, Renderer &renderer)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// run_daemon — forks per connection so one bad input cannot crash the daemon
+// run_daemon — ONE process, connections served sequentially, no fork
+//
+// This banner said "forks per connection so one bad input cannot crash the
+// daemon" for months, directly above the code and the comment explaining that
+// the fork was REMOVED and why. Fixed 2026-09-12.
 // ─────────────────────────────────────────────────────────────────────────────
 void run_daemon(Renderer &renderer)
 {

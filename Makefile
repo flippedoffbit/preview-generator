@@ -100,7 +100,12 @@ LDFLAGS_SAN  := -fsanitize=address,undefined
 
 # ── Release base flags ────────────────────────────────────────────────────────
 # -ffast-math                    safe for PNG rendering, no NaN/Inf needed
-# -fno-exceptions / -fno-rtti    we don't use either; saves unwinding tables + rodata
+# -fno-rtti                      not used; saves rodata. NOTE: exceptions are
+#                                ENABLED and used -- run_daemon's catch(...) is
+#                                the backstop for allocation failures. This
+#                                legend claimed -fno-exceptions was passed; it
+#                                never was, and "restoring" it is a compile
+#                                error, not a saving.
 # -fvisibility=hidden            keeps internals out of export table; better LTO
 # -fno-unwind-tables             no .eh_frame; daemon never needs to unwind
 # -fmerge-all-constants          merge identical string/float literals across TUs
@@ -149,7 +154,8 @@ LDFLAGS_PGO_USE  := $(LDFLAGS_REL)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Protocol flag legend
-#   (empty)       Legacy tab-delimited UDS  — default, Go daemon talks to this
+#   (empty)       Legacy tab-delimited UDS  — dev harness only (test.sh); the
+#                                                 Go client for it is long gone
 #   -DPROTO_HTTP  Bare HTTP/1.0 over UDS    — nginx proxy_pass unix:...
 #   -DPROTO_FCGI  FastCGI over UDS          — nginx fastcgi_pass unix:...
 # ─────────────────────────────────────────────────────────────────────────────
