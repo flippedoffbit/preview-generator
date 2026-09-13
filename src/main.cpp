@@ -242,26 +242,62 @@ struct Canvas
     }
 
     // blit a greyscale glyph bitmap with alpha blend onto canvas
+    // Blend one rasterised glyph onto the canvas.
+    //
+    // COUNTED BEFORE IT WAS REWRITTEN. perf put this at 21.5% of the daemon's
+    // CPU -- the largest single item once fpng's loops were widened -- with an
+    // annotation of scalar movzbl/imul/add and no vector registers at all. A
+    // card is ~350 calls, ~65,000 glyph pixels, average glyph 15x12, and ~13
+    // cycles a pixel for what is three multiply-adds.
+    //
+    // The cost was not the arithmetic. It was per-pixel bookkeeping around it:
+    //
+    //   - FOUR BOUNDS COMPARISONS PER PIXEL, and instrumenting a real card
+    //     showed ZERO pixels are ever clipped. Every glyph is inside the canvas
+    //     by construction, because everything drawn goes through a
+    //     fit_or_truncate helper first. The clip is still here -- blit_glyph is
+    //     the last line of defence for a coordinate bug, and the comment above
+    //     Canvas says so -- but it is computed ONCE as a row/column span
+    //     instead of asked 65,000 times.
+    //   - px.data(), w AND h RE-READ PER PIXEL. Storing through a uint8_t* may
+    //     alias the vector's own pointer and the two ints beside it, so the
+    //     compiler had to reload all three after every store. The same defect
+    //     as the old byte-wise fill(), which was 930 us pretending to be 54.
     void blit_glyph(const uint8_t *bmp, int bw, int bh,
                     int dx, int dy, RGBA c)
     {
         note_ink(dy, dy + bh - 1);
-        for (int row = 0; row < bh; ++row)
+
+        // Clip once: the sub-rectangle of the glyph that lands on the canvas.
+        int x0 = dx < 0 ? -dx : 0;
+        int y0 = dy < 0 ? -dy : 0;
+        int x1 = bw, y1 = bh;
+        if (dx + x1 > w) x1 = w - dx;
+        if (dy + y1 > h) y1 = h - dy;
+        if (x0 >= x1 || y0 >= y1)
+            return;
+
+        // Hoisted out of the loop, which is the whole point.
+        uint8_t *const base = px.data();
+        const size_t stride = (size_t)w * CH;
+        const uint32_t cr = c.r, cg = c.g, cb = c.b;
+
+        for (int row = y0; row < y1; ++row)
         {
-            for (int col = 0; col < bw; ++col)
+            const uint8_t *a = bmp + (size_t)row * bw;
+            uint8_t *p = base + (size_t)(dy + row) * stride + (size_t)(dx + x0) * CH;
+            for (int col = x0; col < x1; ++col, p += CH)
             {
-                int cx = dx + col, cy = dy + row;
-                if (cx < 0 || cy < 0 || cx >= w || cy >= h)
+                const uint32_t alpha = a[col];
+                // Still skipped rather than blended: the blend shifts by 8, not
+                // 255, so alpha 0 is NOT the identity -- it would darken the
+                // pixel by one part in 256.
+                if (!alpha)
                     continue;
-                uint8_t alpha = bmp[row * bw + col];
-                if (alpha == 0)
-                    continue;
-                uint8_t *p = px.data() + (cy * w + cx) * CH;
-                // simple over blend
-                uint16_t ia = 255 - alpha;
-                p[0] = (uint8_t)((c.r * alpha + p[0] * ia) >> 8);
-                p[1] = (uint8_t)((c.g * alpha + p[1] * ia) >> 8);
-                p[2] = (uint8_t)((c.b * alpha + p[2] * ia) >> 8);
+                const uint32_t ia = 255 - alpha;
+                p[0] = (uint8_t)((cr * alpha + p[0] * ia) >> 8);
+                p[1] = (uint8_t)((cg * alpha + p[1] * ia) >> 8);
+                p[2] = (uint8_t)((cb * alpha + p[2] * ia) >> 8);
                 p[3] = 255;
             }
         }
