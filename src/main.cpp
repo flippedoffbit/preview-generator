@@ -33,6 +33,10 @@
 // PNG encoder sizes its reusable buffers from the same numbers.
 #include "card_geometry.h"
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 // The canvas carries PAD rows of background above and below the visible card,
 // so centring the composition is a pointer offset instead of moving 3 MB of
 // pixels. See Canvas::visible_row_offset.
@@ -286,7 +290,64 @@ struct Canvas
         {
             const uint8_t *a = bmp + (size_t)row * bw;
             uint8_t *p = base + (size_t)(dy + row) * stride + (size_t)(dx + x0) * CH;
-            for (int col = x0; col < x1; ++col, p += CH)
+            int col = x0;
+
+#if defined(__AVX2__)
+            // EIGHT PIXELS AT A TIME, AND THE POINT IS THE BRANCH.
+            //
+            // After the bookkeeping fix above, perf's hottest instruction in
+            // this function was `test %r13d,%r13d` at 23.7% -- the `alpha == 0`
+            // test, which is taken about 40% of the time and predicts badly
+            // because it tracks the ragged edge of a glyph. A vector blend has
+            // no branch: it blends all eight lanes and then selects.
+            //
+            // out = (c*alpha + p*(255-alpha)) >> 8, per channel, in 16-bit
+            // lanes; then the alpha byte is forced to 255; then lanes whose
+            // alpha was zero take the ORIGINAL destination back, because the
+            // shift is by 8 and not a divide by 255 -- blending with alpha 0
+            // would darken a pixel by one part in 256 rather than leave it.
+            {
+                const __m256i zero = _mm256_setzero_si256();
+                const __m256i spread = _mm256_setr_epi8(
+                    0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3,
+                    4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7);
+                const __m256i colour = _mm256_set1_epi32(
+                    (int)((uint32_t)cr | ((uint32_t)cg << 8) | ((uint32_t)cb << 16)));
+                const __m256i opaque = _mm256_set1_epi32((int)0xFF000000u);
+                const __m256i c255 = _mm256_set1_epi16(255);
+
+                for (; col + 8 <= x1; col += 8, p += 8 * CH)
+                {
+                    const __m128i a8 = _mm_loadl_epi64((const __m128i *)(a + col));
+                    const __m256i av =
+                        _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(a8), spread);
+                    const __m256i d = _mm256_loadu_si256((const __m256i *)p);
+
+                    const __m256i alo = _mm256_unpacklo_epi8(av, zero);
+                    const __m256i ahi = _mm256_unpackhi_epi8(av, zero);
+                    const __m256i ilo = _mm256_sub_epi16(c255, alo);
+                    const __m256i ihi = _mm256_sub_epi16(c255, ahi);
+                    const __m256i clo = _mm256_unpacklo_epi8(colour, zero);
+                    const __m256i chi = _mm256_unpackhi_epi8(colour, zero);
+                    const __m256i dlo = _mm256_unpacklo_epi8(d, zero);
+                    const __m256i dhi = _mm256_unpackhi_epi8(d, zero);
+
+                    const __m256i rlo = _mm256_srli_epi16(
+                        _mm256_add_epi16(_mm256_mullo_epi16(clo, alo),
+                                         _mm256_mullo_epi16(dlo, ilo)), 8);
+                    const __m256i rhi = _mm256_srli_epi16(
+                        _mm256_add_epi16(_mm256_mullo_epi16(chi, ahi),
+                                         _mm256_mullo_epi16(dhi, ihi)), 8);
+
+                    __m256i res = _mm256_or_si256(_mm256_packus_epi16(rlo, rhi), opaque);
+                    // Where alpha was zero, keep what was already there.
+                    res = _mm256_blendv_epi8(res, d, _mm256_cmpeq_epi8(av, zero));
+                    _mm256_storeu_si256((__m256i *)p, res);
+                }
+            }
+#endif
+
+            for (; col < x1; ++col, p += CH)
             {
                 const uint32_t alpha = a[col];
                 // Still skipped rather than blended: the blend shifts by 8, not
