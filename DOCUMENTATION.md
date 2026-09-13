@@ -474,6 +474,11 @@ symbols, and the bit-packer's cost is per symbol. Smaller output, more work.
 Revisit only if wire bytes ever matter more than CPU; the method is above and
 takes about an hour.
 
+**Not to be confused with the run scan, which WAS worth it** — see
+`src/fpng_card.cpp`'s `match_scan_vec`, which vectorises the loop that finds
+where a run of identical pixels ends and is worth 8-12%. The item below is about
+loop BOUNDS, which is a different and worthless change.
+
 **Compile-time scan bounds in the deflate.** Constant `bpl`, no filter tail loop,
 and the per-flush `dst_ofs + 8 > dst_buf_size` test removed — that test runs
 ~189,000 times a card. Measured **+3.5% and -1.9%**: noise. Not worth a
