@@ -14,6 +14,14 @@
 #   tests/compare_renders.sh <binary-a> <binary-b>
 #
 # Both must be FastCGI builds (…-fcgi, or `make dev` with -DPROTO_FCGI).
+#
+# BUILD BOTH WITH THE SAME OPTIMISATION FLAGS. The release flags include
+# -funsafe-math-optimizations, which changes float rounding in glyph
+# positioning: the same source at -Ofast and at -O2 differs by one pixel on 19
+# of the 22 cards below. Comparing a Makefile release binary against a hand-built
+# -O2 one therefore reports a difference that is nothing to do with the change
+# under test -- which cost an hour on 2026-09-13 and produced a confident, wrong
+# conclusion about a centring change that was in fact byte-neutral.
 set -u
 
 A="${1:?usage: compare_renders.sh <binary-a> <binary-b>}"

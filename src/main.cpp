@@ -33,6 +33,19 @@
 // PNG encoder sizes its reusable buffers from the same numbers.
 #include "card_geometry.h"
 
+// The canvas carries PAD rows of background above and below the visible card,
+// so centring the composition is a pointer offset instead of moving 3 MB of
+// pixels. See Canvas::visible_row_offset.
+//
+// PAD has to cover any shift a layout can ask for. The three layouts want 33,
+// 33 and 66 rows today; 128 is the margin and a layout wanting more is clamped
+// rather than reading outside the buffer. Measured: 132 is byte-identical to
+// 128, and 64 is NOT enough for one of the twenty-two cards in
+// tests/compare_renders.sh -- so this number is a measurement, not a guess.
+static constexpr int PAD = 128;
+static constexpr int VIS_H = IMG_H;
+static constexpr int CANVAS_H = IMG_H + 2 * PAD;
+
 // design-space (1200x630) pixel -> render-space. Every layout literal goes
 // through these so one SCALE knob moves the whole card. Ratios (e.g. the rupee's
 // 0.7 of the digit size) are NOT scaled — they are already relative.
@@ -57,12 +70,16 @@ struct Canvas
     // The vertical extent of everything drawn since the last fill().
     //
     // Tracked per DRAW CALL rather than per pixel — two comparisons for a whole
-    // glyph — so centre_vertically() below costs nothing measurable. Scanning
+    // glyph — so visible_row_offset() below costs nothing measurable. Scanning
     // the finished bitmap for ink would be 756k pixel comparisons on a 2.5 ms
     // render, which is a fifth of the budget to learn something the drawing
     // code already knew.
     int ink_top = INT32_MAX;
     int ink_bottom = INT32_MIN;
+
+    // The rows fill() and paint_margin() have actually painted, so the margin is
+    // painted once and only as far as the shift needs.
+    int filled_top = 0, filled_bottom = 0;
 
     Canvas(int w, int h) : px(w * h * CH), w(w), h(h) {}
 
@@ -114,77 +131,93 @@ struct Canvas
 
         uint32_t packed;
         std::memcpy(&packed, &c, sizeof packed);
-        uint32_t *p = reinterpret_cast<uint32_t *>(px.data());
-        const size_t n = (size_t)w * h;
+
+        // ONLY THE CARD'S OWN ROWS, not the whole padded canvas.
+        //
+        // Painting all 886 rows cost 40% more than the 630 that can be seen,
+        // and measured SLOWER than the old pixel-slide on the booklet layout --
+        // because that layout is already balanced, so the slide it replaced
+        // returned immediately and cost nothing at all. The margin is painted
+        // afterwards in paint_margin(), by exactly the number of rows the shift
+        // turns out to need, which is usually a few dozen and often none.
+        uint32_t *p = reinterpret_cast<uint32_t *>(px.data()) + (size_t)PAD * w;
+        const size_t n = (size_t)w * VIS_H;
         for (size_t i = 0; i < n; ++i)
             p[i] = packed;
+
+        filled_top = PAD;
+        filled_bottom = PAD + VIS_H; // exclusive
         ink_top = INT32_MAX;
         ink_bottom = INT32_MIN;
     }
 
-    // Slide everything drawn so the space above it equals the space below.
+    // Paint whatever of the visible window falls outside what fill() painted.
+    void paint_margin(RGBA c, size_t offset)
+    {
+        static_assert(sizeof(RGBA) == 4, "paint_margin packs RGBA into one store");
+        uint32_t packed;
+        std::memcpy(&packed, &c, sizeof packed);
+        uint32_t *base = reinterpret_cast<uint32_t *>(px.data());
+
+        const int want_top = (int)offset;
+        const int want_bottom = (int)offset + VIS_H; // exclusive
+        if (want_top < filled_top)
+        {
+            for (size_t i = (size_t)want_top * w, e = (size_t)filled_top * w; i < e; ++i)
+                base[i] = packed;
+            filled_top = want_top;
+        }
+        if (want_bottom > filled_bottom)
+        {
+            for (size_t i = (size_t)filled_bottom * w, e = (size_t)want_bottom * w; i < e; ++i)
+                base[i] = packed;
+            filled_bottom = want_bottom;
+        }
+    }
+
+    // WHERE THE VISIBLE CARD STARTS, so that what was drawn sits centred.
     //
-    // MEASURED, NOT TUNED, and that is the point. The three layouts this
-    // renderer produces had top/bottom margins of 83/17, 77/16 and 83/148
-    // against side margins of 80 — the invoice card had been bottom-starved
-    // since it was written, its total's descenders 16px off the edge, and the
-    // booklet card with no contents rows was bottom-heavy by the same amount
-    // again in the other direction. Each could have been fixed by moving
-    // constants until it looked right, three times, and broken again by the
-    // next layout change.
+    // This replaced centre_vertically(), which MOVED THE PIXELS: 630 memcpys of
+    // 4800 bytes each, sliding the whole canvas until the block was centred,
+    // then repainting the band it vacated. That is 3 MB of memory traffic to
+    // act on one integer, and it evicted the canvas from cache immediately
+    // before the encoder read it back -- so it cost more than its own 97 us.
     //
-    // Instead the composition stays anchored at the top-left where it is
-    // written, and the finished block is centred as a whole. A new row, a
-    // longer name that wraps to a smaller size, a kind that draws one line
-    // fewer: all of them stay balanced without anybody re-measuring.
+    // The canvas is taller than the card instead. The composition is drawn from
+    // a fixed anchor inside it and nothing moves; the encoder is handed a
+    // pointer to whichever row leaves equal background above and below. The
+    // rows outside the card are already background because fill() painted the
+    // whole canvas.
     //
-    // The shift is a row-wise move within one buffer and the vacated band is
-    // refilled with the background, so nothing from the previous position
-    // survives.
-    void centre_vertically(RGBA bg)
+    // WHY THIS IS STILL "MEASURED, NOT TUNED", which is what the old comment
+    // here was defending. The three layouts had top/bottom margins of 83/17,
+    // 77/16 and 83/148 against side margins of 80 -- the invoice card was
+    // bottom-starved from the day it was written, its total's descenders 16px
+    // off the edge, and the booklet with no rows was bottom-heavy by the same
+    // amount the other way. Each could have been fixed by moving constants
+    // until it looked right, three times, and broken again by the next layout
+    // change. The composition still stays anchored where it is written and the
+    // finished block is still centred as a whole; only the mechanism changed.
+    size_t visible_row_offset() const
     {
         if (ink_bottom < ink_top)
-            return; // nothing was drawn
-        int block = ink_bottom - ink_top + 1;
-        if (block >= h)
-            return; // taller than the canvas; leave it where it is
-        int shift = (h - block) / 2 - ink_top;
-        if (shift == 0)
-            return;
+            return PAD; // nothing was drawn: the card is where the anchor is
+        const int block = ink_bottom - ink_top + 1;
+        if (block >= VIS_H)
+            return PAD; // taller than the card; leave it at the anchor
+        int start = ink_top - (VIS_H - block) / 2;
+        if (start < 0)
+            start = 0;
+        if (start > h - VIS_H)
+            start = h - VIS_H;
+        return (size_t)start;
+    }
 
-        const size_t stride = (size_t)w * CH;
-        if (shift > 0)
-            for (int y = h - 1; y >= 0; --y)
-            {
-                int src = y - shift;
-                std::memcpy(px.data() + (size_t)y * stride,
-                            src >= 0 && src < h ? px.data() + (size_t)src * stride : px.data(),
-                            stride);
-            }
-        else
-            for (int y = 0; y < h; ++y)
-            {
-                int src = y - shift;
-                std::memcpy(px.data() + (size_t)y * stride,
-                            src >= 0 && src < h ? px.data() + (size_t)src * stride : px.data(),
-                            stride);
-            }
-
-        // Repaint the band the content vacated. Copying a row from outside the
-        // canvas above would otherwise duplicate whatever row 0 happened to
-        // hold, which is a stripe of the old layout across the new margin.
-        int blank_from = shift > 0 ? 0 : h + shift;
-        int blank_to = shift > 0 ? shift : h;
-        for (int y = blank_from; y < blank_to && y < h; ++y)
-            if (y >= 0)
-                for (int x = 0; x < w; ++x)
-                {
-                    uint8_t *p = px.data() + ((size_t)y * w + x) * CH;
-                    p[0] = bg.r; p[1] = bg.g; p[2] = bg.b; p[3] = bg.a;
-                }
-
-        ink_top += shift;
-        ink_bottom += shift;
+    // The first pixel of the visible card. Rows are contiguous, so this is the
+    // whole of the centring.
+    const uint8_t *visible() const
+    {
+        return px.data() + visible_row_offset() * (size_t)w * CH;
     }
 
     // filled rectangle — no blending, solid
@@ -667,7 +700,7 @@ struct Renderer
     // AT ALL: the PNG buffer below and the encoder's own scratch (see
     // src/fpng_card.cpp) are kept for the life of the process on the same
     // reasoning, which on the deploy host was worth 3.6x per card.
-    Canvas canvas{IMG_W, IMG_H};
+    Canvas canvas{IMG_W, CANVAS_H};
 
     // The encoded PNG, reused the same way. render() returns a reference to
     // this, so the three protocol handlers must bind it as `const auto &` —
@@ -780,7 +813,14 @@ struct Renderer
         // ── layout constants ──────────────────────────────────────────────────
         const int LEFT = SPX(80);
         const int RIGHT = IMG_W - SPX(80); // for right-aligned date
-        int y = 0;
+        // Every vertical literal below is design-space, measured from the top of
+        // the CARD -- which is row PAD of the canvas, not row 0. Two places
+        // assign y absolutely instead of accumulating, and both must carry the
+        // anchor: without it everything after them is drawn PAD rows too high
+        // and the card comes out at 76/168 instead of 122/122. That is exactly
+        // what tests/compare_renders.sh caught, and it is invisible by eye.
+        const int TOP = PAD;
+        int y = TOP;
 
         // ── 3. split name into base + optional business suffix ────────────────
         auto [base_name, suffix] = split_business_suffix(name);
@@ -796,9 +836,9 @@ struct Renderer
         // The two runs share a BASELINE rather than a top edge: Font::draw takes
         // the top and derives the baseline from that face's ascent, so aligning
         // the tops of two sizes leaves the larger run sitting visibly low.
-        y = SPX(72);
+        y = TOP + SPX(72);
         int label_x = LEFT;
-        int name_top = SPX(120);
+        int name_top = TOP + SPX(120);
         const char *label_tail = name_label_tail(kind);
         if (kind != CardKind::Invoice && c.count > 0)
         {
@@ -1040,13 +1080,14 @@ struct Renderer
         // frame: what ends up at the bottom is whatever is left over. Centring
         // here costs one row-wise move and makes every kind -- invoice,
         // booklet, booklet with no rows -- balanced by construction.
-        canvas.centre_vertically(theme.bg);
-        PROF_LAP("centre");
+        const size_t vis = canvas.visible_row_offset();
+        canvas.paint_margin(theme.bg, vis);
+        PROF_LAP("centre — a pointer offset plus the margin the shift needs");
 
         // The output buffer is a member, kept across renders like the canvas
         // above it: after the first card its capacity already exceeds anything
         // a card compresses to, so a render allocates nothing at all.
-        fpng::fpng_encode_card(canvas.px.data(), IMG_W, IMG_H, CH, png);
+        fpng::fpng_encode_card(canvas.px.data() + vis * (size_t)IMG_W * CH, IMG_W, IMG_H, CH, png);
         PROF_LAP("png encode");
 
 // #if PROFILE
