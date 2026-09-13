@@ -251,12 +251,28 @@ const Theme &theme_for_amount(uint64_t amount_paise)
     else
         base = 5; // dark-slate  ₹5,00,000+
 
-    // Use the same colour ladder but pick the light variant for even
-    // numbers and the dark variant for odd numbers.  The light variants
-    // are at indices 6..11 (base + 6).
-    bool even = (amount_paise % 2) == 0;
-    int idx = base + (even ? 6 : 0);
-    return THEMES[idx];
+    // The ladder IS the selection. There was a second step here until
+    // 2026-09-13 that chose the light variant (base + 6) when the paise total
+    // was EVEN and the dark one when it was odd, so half of all cards came out
+    // light and which half was decided by the last digit of the money.
+    //
+    // What that cost: a card's scheme was not a property of the invoice, it
+    // was a property of its parity. Correcting an invoice by one paisa
+    // inverted its link preview; two invoices in the same booklet, the same
+    // client, the same day, unfurled in opposite schemes in the same chat
+    // thread. It contradicted this function's own docblock above, which lists
+    // six dark themes and no light ones, and the README, which says the light
+    // variants are reachable only by explicit id. Three descriptions of one
+    // behaviour and the code agreed with none of them.
+    //
+    // The bands stay coarse on purpose — ₹1,000 / ₹10,000 / ₹50,000 / ₹1,00,000
+    // / ₹5,00,000 — so two invoices a paisa apart now land on the same theme
+    // unless they straddle a boundary, where a different colour is the point.
+    //
+    // The light variants (indices 6..11) remain in THEMES and remain reachable
+    // by explicit id through theme_by_id. They are simply no longer reachable
+    // by accident.
+    return THEMES[base];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -641,8 +641,11 @@ mostly wrong on its own; see A6. Budget for HarfBuzz or accept boxes.
   emitting an `og:image` for those bills at all.
 - `handle_client_fcgi` ignores `FCGI_BEGIN_REQUEST`'s role and flags entirely and
   answers any record stream that reaches `FCGI_STDIN` end-of-stream.
-- **The theme ladder flips light/dark on the parity of the paise total** — see
-  Part C; this is a real behaviour, not a documented one.
+- ~~The theme ladder flips light/dark on the parity of the paise total.~~
+  **CLOSED 2026-09-13.** `theme_for_amount` returns the ladder's dark theme and
+  nothing else; the light variants are reachable only by explicit `theme=`,
+  which is what this file, the README and the function's own docblock had all
+  said while the code did otherwise. Proven by `tests/theme_selection.sh`.
 
 ---
 
@@ -757,13 +760,16 @@ still carry some of their own.
 
 **In `preview-generator/README.md`:**
 
-- **The theme section is wrong about light variants.** It says light themes are
-  available "if you explicitly select them by `theme_id`". `theme_for_amount`
-  (`src/themes.cpp:237`) picks the **light** variant when the paise total is even
-  and the dark one when it is odd. Since trunk never sends `theme`, **every live
-  card's light-or-dark appearance is decided by the parity of the total** — a real
-  and undocumented behaviour, and a surprising one: two invoices a paisa apart
-  unfurl in opposite colour schemes.
+- ~~The theme section is wrong about light variants.~~ **CLOSED 2026-09-13, by
+  changing the CODE rather than the README.** The README said light themes are
+  available "if you explicitly select them by `theme_id`", and `theme_for_amount`
+  picked the light variant whenever the paise total was even — so, since trunk
+  never sends `theme`, every live card's light-or-dark appearance was decided by
+  the parity of the total, and two invoices a paisa apart unfurled in opposite
+  schemes. Three descriptions of one behaviour (this file, the README, and the
+  function's own docblock listing six dark themes) agreed with each other and
+  not with the code, which is why the README needed no edit once the parity step
+  was removed. `tests/theme_selection.sh` now holds it.
 - "Rows are ignored on an `invoice` kind" is **false**. `build_card`
   (`src/main.cpp:1136`) accepts rows on either kind, with the reasoning written
   in ("a bill has a contents list too: its line items"), and trunk sends them for
