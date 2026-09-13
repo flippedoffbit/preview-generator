@@ -67,15 +67,64 @@ start () { # $1 binary, $2 sockname -> echoes pid
 PID_A="$(start "$A" a)" || exit 1
 PID_B="$(start "$B" b)" || exit 1
 
+# ── preflight: prove both daemons actually render, before comparing anything ──
+#
+# TWO NOTHINGS COMPARE EQUAL, and worse, two nothings that both fail the
+# plausibility check below used to print "FAIL 22 of 22 cards differ" -- which
+# reads like twenty-two real differences and is in fact one harness mistake.
+# That happened for real on 2026-09-13: a build without -DPROTO_FCGI was handed
+# to this script, spoke a protocol the client does not, answered nothing at all,
+# and the summary said the cards differed. Feeding the tab-delimited protocol to
+# a FastCGI build (or the reverse) fails SILENTLY -- the daemon reads the first
+# bytes as a record header, finds nonsense, and closes cleanly -- which is the
+# single most documented trap in this component, so the script must name it
+# rather than let it look like a diff.
+#
+# Exit status is now three-valued: 0 identical, 1 the cards really differ,
+# 2 the harness did not run. Anything automated should treat 2 as "no result".
+probe () { # $1 = sock, $2 = label, $3 = binary
+  # DELETE IT FIRST. Without this the second probe reads the FIRST probe's file
+  # when the second daemon writes nothing, so a broken candidate inherits a
+  # healthy reference's card and sails through -- which is exactly what the
+  # first version of this preflight did, and it is the same stale-artifact
+  # class as everything else this file guards against.
+  rm -f "$TMP/probe.png"
+  python3 "$CLIENT" --sock "$1" --get "company=Preflight&amount=1,000.00" \
+    -o "$TMP/probe.png" >/dev/null 2>&1
+  local sz=0
+  [ -f "$TMP/probe.png" ] && sz=$(wc -c < "$TMP/probe.png")
+  if [ "$sz" -lt 1000 ]; then
+    echo "HARNESS: $2 ($3) answered $sz bytes, which is not a card."
+    echo "         The likeliest cause is a build without -DPROTO_FCGI: speaking"
+    echo "         FastCGI to it fails silently and looks exactly like this."
+    echo "         Use a ...-fcgi artifact, or 'make dev' built with -DPROTO_FCGI."
+    exit 2
+  fi
+  if [ "$(head -c 4 "$TMP/probe.png" | od -An -tx1 | tr -d ' \n')" != "89504e47" ]; then
+    echo "HARNESS: $2 ($3) answered $sz bytes that are not a PNG."
+    exit 2
+  fi
+}
+probe "$TMP/a.sock" "reference" "$A"
+probe "$TMP/b.sock" "candidate" "$B"
+
 fail=0; n=0
 for q in "${CASES[@]}"; do
   n=$((n+1))
+  rm -f "$TMP/a.png" "$TMP/b.png"
   python3 "$CLIENT" --sock "$TMP/a.sock" --get "$q" -o "$TMP/a.png" >/dev/null 2>&1
   python3 "$CLIENT" --sock "$TMP/b.sock" --get "$q" -o "$TMP/b.png" >/dev/null 2>&1
-  sa=$(wc -c < "$TMP/a.png"); sb=$(wc -c < "$TMP/b.png")
-  # An empty answer from both would compare equal and prove nothing.
-  if [ "$sa" -lt 1000 ]; then
-    echo "  FAIL  case $n: reference produced $sa bytes -- not a card"; fail=$((fail+1)); continue
+  sa=0; sb=0
+  [ -f "$TMP/a.png" ] && sa=$(wc -c < "$TMP/a.png")
+  [ -f "$TMP/b.png" ] && sb=$(wc -c < "$TMP/b.png")
+  # A daemon that stops answering mid-run ABORTS the comparison. It used to
+  # count as one more failing case, so a daemon that died on case 3 reported
+  # twenty differing cards.
+  if [ "$sa" -lt 1000 ] || [ "$sb" -lt 1000 ]; then
+    echo
+    echo "HARNESS: case $n got $sa / $sb bytes -- a daemon stopped answering."
+    echo "         Not a difference in the cards. Query: ${q:0:60}"
+    exit 2
   fi
   if cmp -s "$TMP/a.png" "$TMP/b.png"; then
     printf "  ok    case %2d  %7d bytes\n" "$n" "$sa"
@@ -87,4 +136,4 @@ done
 
 echo
 if [ "$fail" -eq 0 ]; then echo "ok    $n cards, byte-identical"; else echo "FAIL  $fail of $n cards differ"; fi
-exit $((fail > 0))
+exit $((fail > 0))  # 0 identical, 1 they differ; 2 comes from the harness checks above
