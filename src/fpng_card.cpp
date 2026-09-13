@@ -84,6 +84,103 @@
 
 namespace fpng
 {
+
+    // ── adler32, 32 bytes at a time ───────────────────────────────────────────
+    //
+    // fpng's own is `adler32_sse_16`: 16 bytes an iteration behind a runtime
+    // SSE4.1 check, written for a 2013 machine. perf puts it at 18.3% of this
+    // daemon's CPU -- the second largest single item after glyph blitting --
+    // and the annotation is wall-to-wall `%xmm` on a box with AVX-512.
+    //
+    // Adler-32 is s1 = 1 + sum(b), s2 = sum of the running s1. Vectorised the
+    // usual way: `vpsadbw` gives the byte sums eight at a time for s1, and s2
+    // needs each byte weighted by its distance from the end of the block, which
+    // is one `vpmaddubsw` against a descending weight vector plus a `vpmaddwd`
+    // to widen. The block length is capped at NMAX so the 32-bit accumulators
+    // cannot overflow before the modulo.
+    //
+    // THE ONLY THING THAT MAKES THIS SAFE IS THAT IT IS CHECKED AGAINST fpng's
+    // OWN, exhaustively, for every length from 0 to 8192 and for random data --
+    // see tests/fpng_card_test.cpp. A wrong checksum is not a crash: it is a
+    // PNG that some decoders accept and others reject, which would show up as
+    // one messaging app rendering a broken image.
+#if defined(__AVX2__)
+    static uint32_t adler32_avx2(const uint8_t *p, size_t len, uint32_t initial)
+    {
+        constexpr uint32_t K = 65521;
+        constexpr size_t NMAX = 5552; // largest block that cannot overflow uint32
+
+        uint32_t s1 = initial & 0xFFFF, s2 = initial >> 16;
+
+        // Weights 32..1: byte i of a 32-byte chunk contributes (32 - i) to s2.
+        const __m256i w_hi = _mm256_setr_epi8(32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21,
+                                              20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9,
+                                              8, 7, 6, 5, 4, 3, 2, 1);
+        const __m256i ones16 = _mm256_set1_epi16(1);
+        const __m256i zero = _mm256_setzero_si256();
+
+        while (len >= 32)
+        {
+            size_t blocks = len >> 5;
+            if (blocks > NMAX / 32)
+                blocks = NMAX / 32;
+            len -= blocks * 32;
+
+            // s2 grows by 32*s1 for every chunk, counted once up front.
+            s2 += (uint32_t)(s1 * (blocks * 32));
+
+            __m256i v_s1 = zero, v_s2 = zero;
+            for (size_t i = 0; i < blocks; ++i, p += 32)
+            {
+                const __m256i v = _mm256_loadu_si256((const __m256i *)p);
+                // s2 also accumulates the running s1 of PREVIOUS chunks in this
+                // block: each earlier chunk's byte sum is added once per later
+                // chunk. vpsadbw keeps the partial sums; multiply them by the
+                // number of chunks still to come by folding v_s1 in each step.
+                v_s2 = _mm256_add_epi32(v_s2, _mm256_slli_epi32(v_s1, 5));
+                v_s1 = _mm256_add_epi32(v_s1, _mm256_sad_epu8(v, zero));
+                v_s2 = _mm256_add_epi32(
+                    v_s2, _mm256_madd_epi16(_mm256_maddubs_epi16(v, w_hi), ones16));
+            }
+
+            // Horizontal folds.
+            uint32_t t1[8], t2[8];
+            _mm256_storeu_si256((__m256i *)t1, v_s1);
+            _mm256_storeu_si256((__m256i *)t2, v_s2);
+            uint64_t sum1 = 0, sum2 = 0;
+            for (int i = 0; i < 8; ++i) { sum1 += t1[i]; sum2 += t2[i]; }
+            s1 = (uint32_t)((s1 + sum1) % K);
+            s2 = (uint32_t)((s2 + sum2) % K);
+        }
+
+        for (; len; --len, ++p)
+        {
+            s1 += *p;
+            s2 += s1;
+        }
+        s1 %= K;
+        s2 %= K;
+        return (s2 << 16) | s1;
+    }
+#endif
+
+    static inline uint32_t card_adler32(const uint8_t *p, size_t len)
+    {
+#if defined(__AVX2__)
+        return adler32_avx2(p, len, FPNG_ADLER32_INIT);
+#else
+        return fpng_adler32(p, len, FPNG_ADLER32_INIT);
+#endif
+    }
+
+    // One scanline of the up-filter, length known at compile time.
+    template <uint32_t NBYTES>
+    static inline void filter_row_up(const uint8_t *pSrc, const uint8_t *pPrev, uint8_t *pDst)
+    {
+        for (uint32_t i = 0; i < NBYTES; ++i)
+            pDst[i] = (uint8_t)(pSrc[i] - pPrev[i]);
+    }
+
     static inline void match_scan_vec(const uint8_t *p, uint32_t lits,
                                       uint32_t max_match_len, uint32_t &match_len)
     {
@@ -179,7 +276,7 @@ namespace fpng
         const uint8_t *pSrc = pImg;
         uint32_t src_ofs = 0;
 
-        uint32_t src_adler32 = fpng_adler32(pImg, bpl * h, FPNG_ADLER32_INIT);
+        uint32_t src_adler32 = card_adler32(pImg, (size_t)bpl * h);
 
         for (uint32_t y = 0; y < h; y++)
         {
@@ -308,6 +405,11 @@ namespace fpng
         return dst_ofs;
     }
 
+    uint32_t fpng_card_adler32(const uint8_t *p, size_t len)
+    {
+        return card_adler32(p, len);
+    }
+
     bool fpng_encode_card(const void *pImage, uint32_t w, uint32_t h, uint32_t chans,
                           std::vector<uint8_t> &out)
     {
@@ -321,10 +423,23 @@ namespace fpng
         uint32_t temp_ofs = 0;
         for (uint32_t y = 0; y < CARD_H; ++y)
         {
-            apply_filter(y ? 2 : 0, (int)CARD_W, (int)CARD_H, CARD_CH, CARD_BPL,
-                         pImg + (size_t)y * CARD_BPL,
-                         y ? pImg + (size_t)(y - 1) * CARD_BPL : nullptr,
-                         g_card_temp + temp_ofs);
+            // NOT apply_filter(): fpng's is `_mm_sub_epi8` behind a runtime
+            // SSE4.1 check -- 16 bytes an iteration, and perf's annotation of
+            // this loop was wall-to-wall %xmm on a box with AVX-512. With the
+            // row length a compile-time constant there is no tail and no
+            // channel dispatch, and the compiler picks the machine's own width.
+            uint8_t *d = g_card_temp + temp_ofs;
+            if (y)
+            {
+                *d = 2;
+                filter_row_up<CARD_BPL>(pImg + (size_t)y * CARD_BPL,
+                                        pImg + (size_t)(y - 1) * CARD_BPL, d + 1);
+            }
+            else
+            {
+                *d = 0;
+                memcpy(d + 1, pImg, CARD_BPL);
+            }
             temp_ofs += 1 + CARD_BPL;
         }
 

@@ -62,9 +62,47 @@ static void encodes_identically(const std::vector<uint8_t> &rgba, uint32_t w, ui
 // defeats the RLE, which every card we actually draw does not.
 static uint32_t rnd(uint32_t &s) { s ^= s << 13; s ^= s >> 17; s ^= s << 5; return s; }
 
+// The zlib checksum, held equal to fpng's own.
+//
+// This exists because the card encoder computes it with AVX2 where the target
+// has it, and a wrong Adler-32 fails silently in the worst way: the PNG is
+// structurally fine and only the decoders that verify the checksum reject it.
+// Every length from 0 to 8192 covers each vector block count, every tail length
+// and the NMAX block boundary; the data is pseudo-random so no byte value or
+// position is special.
+static void adler32_agrees_with_fpng()
+{
+    uint32_t s = 0xC0FFEE11;
+    std::vector<uint8_t> buf(8192 + 64);
+    for (auto &b : buf)
+        b = (uint8_t)(rnd(s) >> 9);
+
+    int bad = 0;
+    for (size_t len = 0; len <= 8192; ++len)
+    {
+        const uint32_t want = fpng::fpng_adler32(buf.data(), len, fpng::FPNG_ADLER32_INIT);
+        const uint32_t got = fpng::fpng_card_adler32(buf.data(), len);
+        if (want != got && bad++ < 3)
+            check(false, "adler32 at length " + std::to_string(len) + ": got " +
+                             std::to_string(got) + ", fpng says " + std::to_string(want));
+    }
+    check(bad == 0, "adler32 agrees with fpng for every length 0..8192 (" +
+                        std::to_string(bad) + " disagreed)");
+
+    // All-zero and all-0xFF: the extremes of the accumulators.
+    std::vector<uint8_t> z(8192, 0), f(8192, 0xFF);
+    check(fpng::fpng_card_adler32(z.data(), z.size()) ==
+              fpng::fpng_adler32(z.data(), z.size(), fpng::FPNG_ADLER32_INIT),
+          "adler32 agrees on 8192 zero bytes");
+    check(fpng::fpng_card_adler32(f.data(), f.size()) ==
+              fpng::fpng_adler32(f.data(), f.size(), fpng::FPNG_ADLER32_INIT),
+          "adler32 agrees on 8192 0xFF bytes");
+}
+
 int main(int argc, char **argv)
 {
     fpng::fpng_init();
+    adler32_agrees_with_fpng();
     const std::string dir = argc > 1 ? argv[1] : "test_out";
 
     // ── the cards the renderer actually produces ─────────────────────────────
