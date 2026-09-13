@@ -455,6 +455,48 @@ rejected — specialising the scan loops on the compile-time width was worth 3%
 and is deliberately absent, so every hot loop in `vendor/fpng.cpp` is still
 upstream's and a vendor bump stays a file copy.
 
+### Three optimisations that were BUILT AND MEASURED AND REJECTED (2026-09-13)
+
+Recorded so nobody spends the day again. Each was implemented fully and
+measured on the deploy host, release builds, both daemons up with requests
+alternated between them.
+
+**A Huffman table trained on our own cards.** fpng supports this
+(`FPNG_TRAIN_HUFFMAN_TABLES`, `g_huff_counts`, `create_dynamic_block_prefix`);
+the table was trained over a 48-card corpus covering all twelve palettes and all
+four card shapes, and it works — **6.3% smaller than stock, 0.46% off the
+per-image optimum** (worst 3.02%), which is essentially all of the 6.7% that a
+fixed table can win. It is also **11-16% SLOWER**, consistently, on every card
+kind. The likely mechanism is the `if (match_len == 4)` heuristic in the deflate
+loop: a table that makes literals cheap tips that comparison toward emitting
+four literals instead of one match, so the encoder writes fewer bits but more
+symbols, and the bit-packer's cost is per symbol. Smaller output, more work.
+Revisit only if wire bytes ever matter more than CPU; the method is above and
+takes about an hour.
+
+**Compile-time scan bounds in the deflate.** Constant `bpl`, no filter tail loop,
+and the per-flush `dst_ofs + 8 > dst_buf_size` test removed — that test runs
+~189,000 times a card. Measured **+3.5% and -1.9%**: noise. Not worth a
+permanent copy of a vendored hot loop. Note also that removing the bounds check
+is only safe if the output buffer is sized for the true worst case, which is
+**two bytes per filtered input byte** (15 bits a symbol on input that is not a
+card), not the stored-block size — the first attempt crashed `make test`'s noise
+image with a bus error, and fpng's bounds check was the only thing that had ever
+stopped it.
+
+**PGO.** Unreachable for the shipped artifact: zig accepts
+`-fprofile-instr-generate`, emits the counter sections, and links **no profile
+runtime at all** for `x86_64-linux-musl` — an instrumented build runs and writes
+nothing. Measured where it is reachable (g++ on the box, same flags): **-2.0%
+and +0.7%**, noise. An earlier "-4.1%, 6/6" was against a plain `-O3` baseline
+and was mostly a proxy for the `-Ofast -funroll-loops -flto` we already pass.
+And gcc's build, however tuned, is **8-12% slower than the shipped clang/musl
+one, 0 of 10 repetitions faster** — so adopting the box as build machine to gain
+PGO loses more than PGO could return. The Makefile's `pgo-*` targets are also
+inert for the release path: they use the native compiler, drive `test.sh` (the
+LEGACY TAB protocol, not the deployed FastCGI one), instrument at `-O2` while
+building at `-Ofast`, and the daemon never exits so the profile is never written.
+
 `src/gen/font_*.h` are generated, not written — regenerate with `make` after
 changing `assets/`.
 
