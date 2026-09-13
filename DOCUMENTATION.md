@@ -376,23 +376,49 @@ unwind tables when C++ exceptions are enabled, so **the catch does work in the
 release build**. Note that the Makefile's own legend at `Makefile:103` still claims
 `-fno-exceptions` is passed; it is not (see Part C).
 
-Measured performance, **and the machine has to be named or the number is
-misleading** (2026-09-12, 200 requests each, whole request through the FastCGI
-socket, 1200×630):
+Measured performance (2026-09-13, whole request through the FastCGI socket,
+1200×630, interleaved A/B against the previous build at every step):
 
-| | dev Mac (M4) | the deploy host (EPYC 9354P) |
-|---|---|---|
-| before buffer reuse | ~2.2 ms | **8.1 ms** |
-| after | ~2.1 ms | **2.25 ms** |
+| on the deploy host | whole request |
+|---|---|
+| before any of this (2026-09-12) | **8.1 ms** |
+| `fpng`'s scratch buffers become process-owned | 2.3 ms |
+| `canvas.fill` writes a pixel, not four bytes | — |
+| centring becomes a pointer offset | 1.6 ms |
+| the deflate's run scan goes eight pixels wide | 1.4 ms |
+| the filter and the checksum widen to AVX | 1.2 ms |
+| the glyph blit clips once, then blends eight at a time | **1.0 ms** |
 
-The 2.52 ms this section used to quote was a Mac figure presented as the render
-cost, and it was out by 3.2x for the only machine that serves a customer. The
-gap is not the CPU: `fpng` allocated two ~3 MB scratch buffers per call, which
-under static musl is 1479 minor page faults per card (counted with `getrusage`),
-while macOS's allocator caches the block and charges almost nothing. See
-`src/fpng_card.cpp` for the whole measurement. Single threaded, so one slow
-render is a queue — fine at unfurl volumes, and the thing to watch if the card
-ever grows work.
+Every one of those is byte-identical output; `tests/compare_renders.sh` is what
+says so, and for the three that only have a vector path on x86 it has to be run
+ON THE BOX, because the dev Mac is arm64 and would prove nothing about them.
+
+**Name the machine or the number misleads.** The 2.52 ms this section used to
+quote was a Mac figure presented as the render cost, and it was out by 3.2x for
+the only machine that serves a customer. The largest single win of the lot —
+`fpng` allocating two ~3 MB scratch buffers per call, 1479 minor page faults a
+card under static musl — is worth 5.2x on the box and **1.02x on the Mac**,
+because macOS's allocator caches the block. Measuring it locally would have
+concluded there was nothing there.
+
+**Two of the wins were the same bug in different functions**, and neither looked
+like what it was. `canvas.fill` and `blit_glyph` both stored through a
+`uint8_t *` into a buffer whose own pointer and dimensions sat beside it in the
+same object, so the compiler reloaded all three after every store: 930 µs and
+~150 µs of pure reloading, invisible when either loop was benchmarked on its own
+and obvious in situ. Worth grepping for a third.
+
+**And twice the profile said SIMD when the answer was bookkeeping.** `perf`
+annotated `blit_glyph` as scalar `movzbl`/`imul`/`add` with no vector registers,
+which reads as "needs vectorising"; counting first showed four bounds
+comparisons per pixel answering "no" 65,000 times a card, and removing them was
+worth 9% against the 6% the vector blend then added. Count before widening.
+
+What is left is `fpng_encode_card` at ~64% of CPU, and the bulk of that is the
+deflate's bit accumulator: each symbol's position depends on the total bit
+length of every symbol before it, so it cannot be parallelised without a
+two-pass design. Single threaded, so one slow render is a queue — fine at unfurl
+volumes, and the thing to watch if the card ever grows work.
 
 No per-request logging, deliberately (`src/main.cpp:1397`): a hot path serving
 untrusted input, and in a long-lived process a line per card would sit in a
